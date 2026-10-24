@@ -1,53 +1,70 @@
-import { useState } from 'react'
-import {
-  Plus,
-  Play,
-  Square,
-  Trash2,
-  X,
-  DownloadCloud,
-} from 'lucide-react'
 
-import { models as initial } from '@/lib/mock'
+import { useEffect, useState } from 'react'
+import { Plus, RefreshCw, X, Cpu } from 'lucide-react'
 import { PageHeader } from '@/components/ui/PageHeader'
 
+const API_URL =
+  import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
+
+const LLAMA_URL =
+  import.meta.env.VITE_LLAMA_URL || 'http://127.0.0.1:8080'
+
+type ModelInfo = {
+  id: string
+  name: string
+  status: string
+}
+
 export default function Models() {
-  const [models, setModels] = useState(initial)
+  const [models, setModels] = useState<ModelInfo[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
   const [open, setOpen] = useState(false)
-  const [name, setName] = useState('qwen3:8b')
-  const [pulling, setPulling] = useState(false)
+  const [modelName, setModelName] = useState('')
 
-  const pull = () => {
-    setPulling(true)
+  async function loadModels() {
+    setLoading(true)
+    setError('')
 
-    setTimeout(() => {
-      setPulling(false)
-      setOpen(false)
+    try {
+      // llama.cpp exposes an OpenAI-compatible models endpoint.
+      const response = await fetch(`${LLAMA_URL}/v1/models`)
 
-      setModels((m) =>
-        m.some((x) => x.id === name)
-          ? m
-          : [
-              ...m,
-              {
-                name: name.split(':')[0].toUpperCase(),
-                id: name,
-                size: '—',
-                quant: 'Q4_K_M',
-                context: '32K',
-                status: 'READY',
-              },
-            ],
+      if (!response.ok) {
+        throw new Error(`llama.cpp returned HTTP ${response.status}`)
+      }
+
+      const data = await response.json()
+      const list = Array.isArray(data.data) ? data.data : []
+
+      setModels(
+        list.map((item: { id?: string; name?: string }) => ({
+          id: item.id || item.name || 'unknown',
+          name: item.id || item.name || 'Local GGUF model',
+          status: 'AVAILABLE',
+        })),
       )
-    }, 1600)
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Could not connect to the llama.cpp server.',
+      )
+    } finally {
+      setLoading(false)
+    }
   }
+
+  useEffect(() => {
+    void loadModels()
+  }, [])
 
   return (
     <div>
       <PageHeader
         eyebrow="Machine configuration"
         title="LOCAL MODELS"
-        subtitle="Models available to the local inference runtime."
+        subtitle="Models exposed by your local llama.cpp inference server."
         action={
           <button
             onClick={() => setOpen(true)}
@@ -60,145 +77,105 @@ export default function Models() {
       />
 
       <div className="px-7 py-8 lg:px-10">
-        <div className="border-t rule">
-          {models.map((m, i) => (
-            <div
-              key={m.id}
-              className="grid gap-5 border-b rule py-6 lg:grid-cols-[1.4fr_1fr_1fr_1fr_auto] lg:items-center"
+        <div className="mb-5 flex items-center justify-between">
+          <span className="editorial-label">Inference runtime</span>
+          <button
+            onClick={() => void loadModels()}
+            disabled={loading}
+            className="flex items-center gap-2 border rule px-3 py-2 text-xs disabled:opacity-50"
+          >
+            <RefreshCw size={14} />
+            Refresh
+          </button>
+        </div>
+
+        {loading && <p className="py-8 text-sm">Checking local models…</p>}
+
+        {!loading && error && (
+          <div className="border rule p-5 text-sm">
+            <p className="text-[var(--error)]">{error}</p>
+            <p className="mt-2 text-[var(--muted)]">
+              Make sure llama-server is running on port 8080.
+            </p>
+            <button
+              onClick={() => void loadModels()}
+              className="mt-4 border rule px-3 py-2 text-xs"
             >
-              {/* Model */}
-              <div>
-                <div className="mono text-sm font-semibold">
-                  {m.name}
-                </div>
+              Try again
+            </button>
+          </div>
+        )}
 
-                <div className="mt-1 mono text-[10px] text-[var(--muted)]">
-                  {m.id}
-                </div>
-              </div>
+        {!loading && !error && models.length === 0 && (
+          <p className="border rule p-5 text-sm">
+            The server responded, but did not report any models.
+          </p>
+        )}
 
-              {/* Parameters */}
-              <div>
-                <div className="editorial-label">
-                  Parameters
-                </div>
-
-                <div className="mt-1 mono text-xs">
-                  {m.name.includes('8B') ? '8B' : '—'}
-                </div>
-              </div>
-
-              {/* Quantization */}
-              <div>
-                <div className="editorial-label">
-                  Quantization
-                </div>
-
-                <div className="mt-1 mono text-xs">
-                  {m.quant}
+        {!loading &&
+          !error &&
+          models.map((model) => (
+            <div
+              key={model.id}
+              className="grid gap-4 border-t rule py-6 lg:grid-cols-[1fr_auto_auto] lg:items-center"
+            >
+              <div className="flex items-start gap-3">
+                <Cpu size={18} className="mt-1 text-[var(--muted)]" />
+                <div>
+                  <div className="mono text-sm font-semibold">
+                    {model.name}
+                  </div>
+                  <div className="mt-1 break-all mono text-[10px] text-[var(--muted)]">
+                    {model.id}
+                  </div>
                 </div>
               </div>
-
-              {/* Size / Context */}
-              <div>
-                <div className="editorial-label">
-                  Size / Context
-                </div>
-
-                <div className="mt-1 mono text-xs">
-                  {m.size} · {m.context}
-                </div>
-              </div>
-
-              {/* Actions */}
-              <div className="flex items-center gap-2">
-                <span className="mono mr-2 text-[10px] text-[var(--success)]">
-                  ● {m.status}
-                </span>
-
-                <button
-                  title="Start"
-                  className="p-2 text-[var(--muted)]"
-                >
-                  <Play size={14} />
-                </button>
-
-                <button
-                  title="Stop"
-                  className="p-2 text-[var(--muted)]"
-                >
-                  <Square size={13} />
-                </button>
-
-                <button
-                  title="Delete"
-                  onClick={() =>
-                    setModels((x) =>
-                      x.filter((_, n) => n !== i),
-                    )
-                  }
-                  className="p-2 text-[var(--muted)] hover:text-[var(--error)]"
-                >
-                  <Trash2 size={14} />
-                </button>
-              </div>
+              <span className="mono text-[10px] text-[var(--success)]">
+                ● {model.status}
+              </span>
+              <span className="text-xs text-[var(--muted)]">
+                Served by llama.cpp
+              </span>
             </div>
           ))}
-        </div>
       </div>
 
-      {/* Add model modal */}
       {open && (
         <div className="fixed inset-0 z-50 grid place-items-center bg-black/20 p-5">
           <div className="w-full max-w-md border rule bg-[var(--bg)] shadow-xl">
-            {/* Header */}
             <div className="flex justify-between border-b rule p-6">
               <div>
-                <div className="editorial-label">
-                  Local runtime
-                </div>
-
-                <h2 className="mt-2 text-lg font-semibold">
-                  Add model
-                </h2>
+                <div className="editorial-label">Local runtime</div>
+                <h2 className="mt-2 text-lg font-semibold">Add model</h2>
               </div>
-
-              <button onClick={() => setOpen(false)}>
+              <button onClick={() => setOpen(false)} aria-label="Close">
                 <X size={18} />
               </button>
             </div>
-
-            {/* Form */}
-            <div className="space-y-5 p-6">
+            <div className="space-y-4 p-6">
+              <p className="text-sm text-[var(--muted)]">
+                Model downloads are not connected yet. Your backend needs a
+                GGUF download endpoint before this action can install models.
+              </p>
               <label className="block">
-                <span className="editorial-label">
-                  Model identifier
-                </span>
-
+                <span className="editorial-label">Model identifier</span>
                 <input
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  className="mt-2 w-full border rule bg-transparent px-3 py-3 mono text-xs outline-none focus:border-[var(--accent)]"
-                  placeholder="qwen3:8b"
+                  value={modelName}
+                  onChange={(event) => setModelName(event.target.value)}
+                  className="mt-2 w-full border rule bg-transparent px-3 py-3 mono text-xs outline-none"
+                  placeholder="Hugging Face model ID"
                 />
               </label>
-
               <button
-                disabled={pulling}
-                onClick={pull}
-                className="flex w-full items-center justify-center gap-2 bg-[var(--accent)] px-4 py-3 text-[10px] uppercase tracking-wider text-[var(--bg)] disabled:opacity-60"
+                onClick={() => {
+                  setOpen(false)
+                  setError(
+                    'Model downloading is not implemented by the backend yet.',
+                  )
+                }}
+                className="w-full border rule px-4 py-3 text-xs uppercase tracking-wider"
               >
-                {pulling ? (
-                  <>
-                    <DownloadCloud
-                      size={14}
-                      className="animate-pulse"
-                    />
-                    Pulling model…
-                  </>
-                ) : (
-                  <>Pull model</>
-                )}
+                Close
               </button>
             </div>
           </div>

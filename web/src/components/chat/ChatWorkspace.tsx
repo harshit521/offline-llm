@@ -1,4 +1,5 @@
-import { useState } from 'react'
+
+import { useRef, useState } from 'react'
 import {
   Paperclip,
   Play,
@@ -16,84 +17,208 @@ type Msg = {
   time: string
 }
 
-const seed: Msg[] = []
+type ChatApiResponse = {
+  content?: string
+  model?: string
+  usage?: {
+    prompt_tokens?: number
+    completion_tokens?: number
+    total_tokens?: number
+  }
+}
 
-const response = `CAP theorem describes a constraint on distributed systems: when a network partition occurs, a system can guarantee **consistency** or **availability**, but not both at the same time.
+const API_URL =
+  import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8000'
 
-A simple example is a distributed database with two nodes. If the nodes lose communication, a consistency-first design may refuse writes until they agree again. An availability-first design may keep accepting writes and reconcile them later.
-
-The third property, partition tolerance, is generally treated as mandatory for distributed systems because network failures can happen independently of the application.`
+const MODEL_NAME = 'Qwen3.5 0.8B (GGUF)'
 
 export function ChatWorkspace() {
-  const [messages, setMessages] = useState<Msg[]>(seed)
+  const [messages, setMessages] = useState<Msg[]>([])
   const [input, setInput] = useState('')
   const [generating, setGenerating] = useState(false)
-  const [model, setModel] = useState('Qwen3 8B')
+  const [model, setModel] = useState(MODEL_NAME)
+  const [error, setError] = useState('')
 
-  const send = () => {
-    if (!input.trim() || generating) return
+  const abortControllerRef = useRef<AbortController | null>(null)
+
+  const send = async (
+    promptOverride?: string,
+    historyOverride?: Msg[],
+  ) => {
+    const prompt = (promptOverride ?? input).trim()
+
+    if (!prompt || generating) return
 
     const now = new Date().toLocaleTimeString([], {
       hour: '2-digit',
       minute: '2-digit',
     })
 
-    setMessages((m) => [
-      ...m,
-      {
-        role: 'USER',
-        text: input.trim(),
-        time: now,
-      },
+    const userMessage: Msg = {
+      role: 'USER',
+      text: prompt,
+      time: now,
+    }
+
+    const conversationHistory = historyOverride ?? messages
+    const nextMessages = [...conversationHistory, userMessage]
+
+    setMessages([
+      ...nextMessages,
+      { role: 'ASSISTANT', text: '', time: now },
     ])
 
     setInput('')
     setGenerating(true)
+    setError('')
 
-    setTimeout(() => {
-      setMessages((m) => [
-        ...m,
-        {
-          role: 'ASSISTANT',
-          text: '',
-          time: now,
+    const controller = new AbortController()
+    abortControllerRef.current = controller
+
+    try {
+      const response = await fetch(`${API_URL}/api/chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
         },
-      ])
+        signal: controller.signal,
+        body: JSON.stringify({
+          messages: nextMessages.map((message) => ({
+            role: message.role === 'USER' ? 'user' : 'assistant',
+            content: message.text,
+          })),
+          temperature: 0.2,
+          max_tokens: 512,
+        }),
+      })
 
-      let i = 0
+      if (!response.ok) {
+        const errorText = await response.text()
+        throw new Error(
+          `Backend returned HTTP ${response.status}: ${errorText}`,
+        )
+      }
 
-      const timer = setInterval(() => {
-        i += Math.max(8, Math.floor(response.length / 45))
+      const result: ChatApiResponse = await response.json()
 
-        setMessages((m) => {
-          const a = [...m]
-          const last = a.length - 1
+      if (
+        typeof result.content !== 'string' ||
+        result.content.trim().length === 0
+      ) {
+        throw new Error(
+          `The backend returned an empty or invalid response: ${JSON.stringify(result)}`,
+        )
+      }
 
-          if (last >= 0 && a[last].role === 'ASSISTANT') {
-            a[last] = {
-              ...a[last],
-              text: response.slice(0, i),
+      setMessages((current) => {
+        const updated = [...current]
+        const last = updated.length - 1
+
+        if (last >= 0 && updated[last].role === 'ASSISTANT') {
+          updated[last] = {
+            ...updated[last],
+            text: result.content!,
+          }
+        }
+
+        return updated
+      })
+
+      if (result.model) {
+        setModel(result.model)
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        setMessages((current) => {
+          const updated = [...current]
+          const last = updated.length - 1
+
+          if (last >= 0 && updated[last].role === 'ASSISTANT') {
+            updated[last] = {
+              ...updated[last],
+              text: '[Generation stopped]',
             }
           }
 
-          return a
+          return updated
         })
 
-        if (i >= response.length) {
-          clearInterval(timer)
-          setGenerating(false)
+        return
+      }
+
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'An unknown error occurred.'
+
+      setError(message)
+
+      setMessages((current) => {
+        const updated = [...current]
+        const last = updated.length - 1
+
+        if (last >= 0 && updated[last].role === 'ASSISTANT') {
+          updated[last] = {
+            ...updated[last],
+            text: `Error: ${message}`,
+          }
         }
-      }, 55)
-    }, 450)
+
+        return updated
+      })
+    } finally {
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null
+      }
+      setGenerating(false)
+    }
   }
 
-  const copy = (t: string) => {
-    navigator.clipboard?.writeText(t)
+  const stopGeneration = () => {
+    abortControllerRef.current?.abort()
+  }
+
+  const copy = (text: string) => {
+    void navigator.clipboard?.writeText(text)
+  }
+
+  const regenerate = (assistantIndex: number) => {
+    if (generating) return
+
+    const userIndex = assistantIndex - 1
+    const userMessage = messages[userIndex]
+
+    if (userMessage?.role !== 'USER') return
+
+    const history = messages.slice(0, userIndex)
+    void send(userMessage.text, history)
+  }
+
+  const clearConversation = () => {
+    if (generating) return
+    setMessages([])
+    setError('')
+  }
+
+  const exportConversation = () => {
+    const text = messages
+      .map((message) => `${message.role}: ${message.text}`)
+      .join('\n\n')
+
+    const blob = new Blob([text], {
+      type: 'text/plain;charset=utf-8',
+    })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+
+    link.href = url
+    link.download = 'offline-session.txt'
+    link.click()
+    URL.revokeObjectURL(url)
   }
 
   return (
     <div className="flex min-h-screen flex-col">
-      {/* Header */}
       <header className="border-b rule px-7 py-5 lg:px-9">
         <div className="flex items-start justify-between gap-4">
           <div>
@@ -107,15 +232,14 @@ export function ChatWorkspace() {
           </div>
 
           <div className="flex items-center gap-2">
-            {/* Model selector */}
             <div className="relative">
               <select
                 value={model}
-                onChange={(e) => setModel(e.target.value)}
-                className="appearance-none border rule bg-transparent py-2 pl-3 pr-8 mono text-[11px] outline-none"
+                onChange={(event) => setModel(event.target.value)}
+                disabled={generating}
+                className="appearance-none border rule bg-transparent py-2 pl-3 pr-8 mono text-[11px] outline-none disabled:opacity-50"
               >
-                <option>Qwen3 8B</option>
-                <option>Llama 3</option>
+                <option value={model}>{model}</option>
               </select>
 
               <ChevronDown
@@ -124,32 +248,18 @@ export function ChatWorkspace() {
               />
             </div>
 
-            {/* Clear conversation */}
             <button
               title="Clear conversation"
-              onClick={() => setMessages([])}
-              className="grid h-8 w-8 place-items-center border rule text-[var(--muted)] hover:text-[var(--text)]"
+              onClick={clearConversation}
+              disabled={generating}
+              className="grid h-8 w-8 place-items-center border rule text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-50"
             >
               <Trash2 size={14} />
             </button>
 
-            {/* Export conversation */}
             <button
               title="Export conversation"
-              onClick={() => {
-                const t = messages
-                  .map((x) => `${x.role}: ${x.text}`)
-                  .join('\n\n')
-
-                const a = document.createElement('a')
-
-                a.href = URL.createObjectURL(
-                  new Blob([t], { type: 'text/plain' }),
-                )
-
-                a.download = 'offline-session.txt'
-                a.click()
-              }}
+              onClick={exportConversation}
               className="hidden h-8 items-center gap-2 border rule px-3 text-[10px] uppercase tracking-wider sm:flex"
             >
               <Download size={13} />
@@ -159,33 +269,37 @@ export function ChatWorkspace() {
         </div>
       </header>
 
-      {/* Messages */}
       <section className="flex-1 px-7 py-10 lg:px-14">
         {messages.length === 0 ? (
           <Empty />
         ) : (
           <div className="mx-auto max-w-3xl">
-            {messages.map((m, i) => (
+            {messages.map((message, index) => (
               <article
-                key={i}
+                key={index}
                 className="fade-in border-b rule py-7 first:pt-0"
               >
                 <div className="mb-3 flex justify-between">
-                  <div className="editorial-label">{m.role}</div>
+                  <div className="editorial-label">
+                    {message.role}
+                  </div>
 
                   <span className="mono text-[10px] text-[var(--muted)]">
-                    {m.time}
+                    {message.time}
                   </span>
                 </div>
 
                 <div className="prose-local whitespace-pre-wrap text-[15px] leading-7">
-                  {m.text}
+                  {message.text ||
+                    (generating && message.role === 'ASSISTANT'
+                      ? 'Thinking...'
+                      : '')}
                 </div>
 
-                {m.role === 'ASSISTANT' && (
+                {message.role === 'ASSISTANT' && message.text && (
                   <div className="mt-5 flex gap-2">
                     <button
-                      onClick={() => copy(m.text)}
+                      onClick={() => copy(message.text)}
                       className="flex items-center gap-1 border rule px-2 py-1 text-[9px] tracking-wider text-[var(--muted)]"
                     >
                       <Copy size={11} />
@@ -193,12 +307,9 @@ export function ChatWorkspace() {
                     </button>
 
                     <button
-                      onClick={() =>
-                        setInput(
-                          'Regenerate the previous answer with a clearer example.',
-                        )
-                      }
-                      className="flex items-center gap-1 border rule px-2 py-1 text-[9px] tracking-wider text-[var(--muted)]"
+                      onClick={() => regenerate(index)}
+                      disabled={generating}
+                      className="flex items-center gap-1 border rule px-2 py-1 text-[9px] tracking-wider text-[var(--muted)] disabled:opacity-50"
                     >
                       <RotateCcw size={11} />
                       REGENERATE
@@ -210,7 +321,7 @@ export function ChatWorkspace() {
 
             {generating && (
               <div className="mt-6 mono text-[10px] text-[var(--accent)]">
-                ASSISTANT ·{' '}
+                {model} ·{' '}
                 <span className="inline-block animate-pulse">
                   ● GENERATING
                 </span>
@@ -220,16 +331,15 @@ export function ChatWorkspace() {
         )}
       </section>
 
-      {/* Input */}
       <div className="sticky bottom-0 bg-[var(--bg)] px-7 pb-6 pt-2 lg:px-14">
         <div className="mx-auto max-w-3xl border rule bg-[var(--surface)]">
           <textarea
             value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault()
-                send()
+            onChange={(event) => setInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault()
+                void send()
               }
             }}
             rows={3}
@@ -241,6 +351,9 @@ export function ChatWorkspace() {
             <div className="flex items-center gap-3">
               <button
                 title="Attach document"
+                onClick={() => {
+                  setError('Document attachment is not implemented yet.')
+                }}
                 className="grid h-7 w-7 place-items-center text-[var(--muted)] hover:text-[var(--text)]"
               >
                 <Paperclip size={15} />
@@ -257,7 +370,7 @@ export function ChatWorkspace() {
 
             {generating ? (
               <button
-                onClick={() => setGenerating(false)}
+                onClick={stopGeneration}
                 className="flex items-center gap-2 bg-[var(--text)] px-3 py-1.5 text-[10px] text-[var(--bg)]"
               >
                 <Square size={11} fill="currentColor" />
@@ -265,14 +378,24 @@ export function ChatWorkspace() {
               </button>
             ) : (
               <button
-                onClick={send}
-                className="flex items-center gap-2 bg-[var(--accent)] px-3 py-1.5 text-[10px] text-[var(--bg)]"
+                onClick={() => void send()}
+                disabled={!input.trim()}
+                className="flex items-center gap-2 bg-[var(--accent)] px-3 py-1.5 text-[10px] text-[var(--bg)] disabled:opacity-50"
               >
                 <Play size={11} fill="currentColor" />
                 RUN
               </button>
             )}
           </div>
+
+          {error && (
+            <div
+              role="alert"
+              className="border-t rule px-4 py-2 text-xs text-red-500"
+            >
+              {error}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -300,22 +423,16 @@ function Empty() {
           ['02', 'ANALYZE', 'Examine arguments, concepts, or technical material'],
           ['03', 'WRITE', 'Draft, rewrite, or improve text'],
           ['04', 'ASK', 'Query the local language model'],
-        ].map((x) => (
+        ].map((item) => (
           <div
-            key={x[0]}
+            key={item[0]}
             className="grid grid-cols-[34px_130px_1fr] items-center gap-4 border-b rule py-5 text-sm"
           >
             <span className="mono text-[10px] text-[var(--muted)]">
-              {x[0]}
+              {item[0]}
             </span>
-
-            <span className="font-semibold tracking-wide">
-              {x[1]}
-            </span>
-
-            <span className="text-[var(--muted)]">
-              {x[2]}
-            </span>
+            <span className="mono text-[10px]">{item[1]}</span>
+            <span className="text-[var(--muted)]">{item[2]}</span>
           </div>
         ))}
       </div>
