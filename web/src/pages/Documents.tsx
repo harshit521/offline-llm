@@ -10,13 +10,12 @@ import {
 } from 'lucide-react'
 
 import { documents as initial } from '@/lib/mock'
+import type { Document } from '@/types'
 import { PageHeader } from '@/components/ui/PageHeader'
 
 export default function Documents() {
-  const [docs, setDocs] = useState(initial)
-  const [selected, setSelected] = useState<
-    (typeof initial)[number] | null
-  >(null)
+  const [docs, setDocs] = useState<Document[]>(initial)
+  const [selected, setSelected] = useState<Document | null>(null)
 
   const add = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
@@ -25,10 +24,12 @@ export default function Documents() {
 
     setDocs((d) => [
       {
+        id: `doc-${Date.now()}`,
         name: f.name,
         type: f.name.split('.').pop()?.toUpperCase() || 'FILE',
         size: `${Math.max(1, Math.round(f.size / 1024))} KB`,
         status: 'PROCESSING',
+        content: '',
         added: 'Just now',
         pages: '—',
         chunks: 0,

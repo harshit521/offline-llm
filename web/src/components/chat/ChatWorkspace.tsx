@@ -1,5 +1,4 @@
-
-import { useRef, useState } from 'react'
+import { useRef, useState, useCallback } from 'react'
 import {
   Paperclip,
   Play,
@@ -11,29 +10,15 @@ import {
   ChevronDown,
 } from 'lucide-react'
 
-type Msg = {
-  role: 'USER' | 'ASSISTANT'
-  text: string
-  time: string
-}
-
-type ChatApiResponse = {
-  content?: string
-  model?: string
-  usage?: {
-    prompt_tokens?: number
-    completion_tokens?: number
-    total_tokens?: number
-  }
-}
-
-const API_URL =
-  import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8000'
+import { sendChat, sendChatStream } from '@/lib/api'
+import type { ChatMessage } from '@/types'
+import { MessageContent } from '@/components/chat/MessageContent'
+import { usePersistedSettings } from '@/store/settingsStore'
 
 const MODEL_NAME = 'Qwen3.5 0.8B (GGUF)'
 
 export function ChatWorkspace() {
-  const [messages, setMessages] = useState<Msg[]>([])
+  const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [generating, setGenerating] = useState(false)
   const [model, setModel] = useState(MODEL_NAME)
@@ -43,7 +28,7 @@ export function ChatWorkspace() {
 
   const send = async (
     promptOverride?: string,
-    historyOverride?: Msg[],
+    historyOverride?: ChatMessage[],
   ) => {
     const prompt = (promptOverride ?? input).trim()
 
@@ -54,7 +39,7 @@ export function ChatWorkspace() {
       minute: '2-digit',
     })
 
-    const userMessage: Msg = {
+    const userMessage: ChatMessage = {
       role: 'USER',
       text: prompt,
       time: now,
@@ -72,63 +57,25 @@ export function ChatWorkspace() {
     setGenerating(true)
     setError('')
 
+    // Create abort controller for this generation request
     const controller = new AbortController()
     abortControllerRef.current = controller
 
     try {
-      const response = await fetch(`${API_URL}/api/chat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        signal: controller.signal,
-        body: JSON.stringify({
-          messages: nextMessages.map((message) => ({
-            role: message.role === 'USER' ? 'user' : 'assistant',
-            content: message.text,
-          })),
-          temperature: 0.2,
-          max_tokens: 512,
-        }),
-      })
+      // Use streaming API to receive tokens as they're generated
+      const contentChunks: string[] = []
 
-      if (!response.ok) {
-        const errorText = await response.text()
-        throw new Error(
-          `Backend returned HTTP ${response.status}: ${errorText}`,
-        )
-      }
+      const { temperature, maxTokens } = usePersistedSettings()
 
-      const result: ChatApiResponse = await response.json()
+      for await (const delta of sendChatStream(
+        nextMessages,
+        { temperature, max_tokens: maxTokens },
+        controller.signal,
+      )) {
+        // Append each delta to the content chunks array
+        contentChunks.push(delta)
 
-      if (
-        typeof result.content !== 'string' ||
-        result.content.trim().length === 0
-      ) {
-        throw new Error(
-          `The backend returned an empty or invalid response: ${JSON.stringify(result)}`,
-        )
-      }
-
-      setMessages((current) => {
-        const updated = [...current]
-        const last = updated.length - 1
-
-        if (last >= 0 && updated[last].role === 'ASSISTANT') {
-          updated[last] = {
-            ...updated[last],
-            text: result.content!,
-          }
-        }
-
-        return updated
-      })
-
-      if (result.model) {
-        setModel(result.model)
-      }
-    } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') {
+        // Update the last message with accumulated content
         setMessages((current) => {
           const updated = [...current]
           const last = updated.length - 1
@@ -136,46 +83,45 @@ export function ChatWorkspace() {
           if (last >= 0 && updated[last].role === 'ASSISTANT') {
             updated[last] = {
               ...updated[last],
-              text: '[Generation stopped]',
+              text: contentChunks.join(''),
             }
           }
 
           return updated
         })
-
-        return
       }
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        // User cancelled generation - update UI to reflect stopped state
+        setMessages((current) => {
+          const updated = [...current]
+          const last = updated.length - 1
 
-      const message =
-        err instanceof Error
-          ? err.message
-          : 'An unknown error occurred.'
-
-      setError(message)
-
-      setMessages((current) => {
-        const updated = [...current]
-        const last = updated.length - 1
-
-        if (last >= 0 && updated[last].role === 'ASSISTANT') {
-          updated[last] = {
-            ...updated[last],
-            text: `Error: ${message}`,
+          if (last >= 0 && updated[last].role === 'ASSISTANT') {
+            updated[last] = {
+              ...updated[last],
+              text: updated[last].text || 'Generation stopped',
+            }
           }
-        }
 
-        return updated
-      })
-    } finally {
-      if (abortControllerRef.current === controller) {
-        abortControllerRef.current = null
+          return updated
+        })
+      } else {
+        // Other error
+        setError(
+          err instanceof Error ? err.message : 'An unknown error occurred.'
+        )
       }
+    } finally {
+      abortControllerRef.current = null
       setGenerating(false)
     }
   }
 
   const stopGeneration = () => {
-    abortControllerRef.current?.abort()
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    }
   }
 
   const copy = (text: string) => {
@@ -289,12 +235,7 @@ export function ChatWorkspace() {
                   </span>
                 </div>
 
-                <div className="prose-local whitespace-pre-wrap text-[15px] leading-7">
-                  {message.text ||
-                    (generating && message.role === 'ASSISTANT'
-                      ? 'Thinking...'
-                      : '')}
-                </div>
+                <MessageContent content={message.text} className="prose-local whitespace-pre-wrap text-[15px] leading-7" />
 
                 {message.role === 'ASSISTANT' && message.text && (
                   <div className="mt-5 flex gap-2">
@@ -314,6 +255,12 @@ export function ChatWorkspace() {
                       <RotateCcw size={11} />
                       REGENERATE
                     </button>
+                  </div>
+                )}
+
+                {generating && message.role === 'ASSISTANT' && !message.text && (
+                  <div className="mt-5 text-sm text-[var(--muted)]">
+                    Generating...
                   </div>
                 )}
               </article>

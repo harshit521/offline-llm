@@ -1,4 +1,3 @@
-
 import os
 
 import httpx
@@ -35,6 +34,7 @@ async def list_models():
 
 
 async def chat(messages, temperature=0.2, max_tokens=512):
+    """Non-streaming chat completion."""
     payload = {
         "messages": messages,
         "temperature": temperature,
@@ -59,3 +59,48 @@ async def chat(messages, temperature=0.2, max_tokens=512):
         "usage": result.get("usage"),
         "model": result.get("model"),
     }
+
+
+async def stream_chat(messages, temperature=0.2, max_tokens=512):
+    """Async generator that streams chat completions from llama.cpp.
+
+    Yields dicts with either {"content": "delta_text"} or {"error": "error_message"}.
+    Recognizes [DONE] termination.
+    """
+    payload = {
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        async with client.stream(
+            "POST",
+            f"{LLAMA_BASE_URL}/v1/chat/completions",
+            json=payload,
+        ) as response:
+            response.raise_for_status()
+
+            async for chunk in response.aiter_lines():
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+
+                if chunk == "[DONE]":
+                    yield {"done": True}
+                    break
+
+                try:
+                    import json
+                    data = json.loads(chunk[6:]) if chunk.startswith("data: ") else json.loads(chunk)
+                    delta = data.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content")
+                    if content is not None:
+                        yield {"content": content}
+                    else:
+                        yield {"content": ""}
+                except (json.JSONDecodeError, KeyError, IndexError) as e:
+                    # Skip malformed chunks but continue streaming
+                    yield {"error": f"malformed_chunk: {str(e)}"}
+                    continue

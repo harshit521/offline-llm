@@ -1,13 +1,10 @@
-
 import { useEffect, useState } from 'react'
 import { Plus, RefreshCw, X, Cpu } from 'lucide-react'
 import { PageHeader } from '@/components/ui/PageHeader'
+import { listModels } from '@/lib/api'
 
 const API_URL =
   import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
-
-const LLAMA_URL =
-  import.meta.env.VITE_LLAMA_URL || 'http://127.0.0.1:8080'
 
 type ModelInfo = {
   id: string
@@ -27,23 +24,8 @@ export default function Models() {
     setError('')
 
     try {
-      // llama.cpp exposes an OpenAI-compatible models endpoint.
-      const response = await fetch(`${LLAMA_URL}/v1/models`)
-
-      if (!response.ok) {
-        throw new Error(`llama.cpp returned HTTP ${response.status}`)
-      }
-
-      const data = await response.json()
-      const list = Array.isArray(data.data) ? data.data : []
-
-      setModels(
-        list.map((item: { id?: string; name?: string }) => ({
-          id: item.id || item.name || 'unknown',
-          name: item.id || item.name || 'Local GGUF model',
-          status: 'AVAILABLE',
-        })),
-      )
+      const data = await listModels()
+      setModels(data)
     } catch (err) {
       setError(
         err instanceof Error
