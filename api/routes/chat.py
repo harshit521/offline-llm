@@ -1,10 +1,12 @@
 import json
 import os
-from fastapi import APIRouter, HTTPException
+import uuid
+from fastapi import APIRouter, HTTPException, Path, Depends
 from pydantic import BaseModel, Field
 import httpx
 
 from llama_client import chat, stream_chat, LLAMA_BASE_URL
+from models import Conversation, Message, get_db, init_db
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -110,3 +112,167 @@ async def list_models():
                 status_code=503,
                 detail=f"Unable to fetch models: {exc}",
             ) from exc
+
+
+# --- Conversation API endpoints ---
+
+CONVERSATION_ID_LENGTH = 50  # prefix length for generating titles
+
+
+@router.get("/conversations", response_model=list)
+async def list_conversations():
+    """List all conversations."""
+    db = get_db()
+    try:
+        conversations = db.query(Conversation).order_by(
+            Conversation.updated_at.desc()
+        ).all()
+        return [
+            {
+                "id": c.id,
+                "title": c.title,
+                "model": c.model,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+                "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+            }
+            for c in conversations
+        ]
+    finally:
+        db.close()
+
+
+@router.post("/conversations", response_model=dict)
+async def create_conversation(title: str = "New Conversation"):
+    """Create a new conversation."""
+    db = get_db()
+    try:
+        conv = Conversation(id="", title=title, model=None)
+        # Generate a proper ID
+        import uuid
+        conv.id = str(uuid.uuid4())
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+        return {
+            "id": conv.id,
+            "title": conv.title,
+            "model": conv.model,
+            "created_at": conv.created_at.isoformat() if conv.created_at else None,
+            "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
+        }
+    finally:
+        db.close()
+
+
+@router.get("/conversations/{conversation_id}", response_model=dict)
+async def get_conversation(
+    conversation_id: str = Path(...),
+):
+    """Get a specific conversation by ID."""
+    db = get_db()
+    try:
+        conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        messages = (
+            db.query(Message)
+            .filter(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.asc())
+            .all()
+        )
+        return {
+            "id": conv.id,
+            "title": conv.title,
+            "model": conv.model,
+            "created_at": conv.created_at.isoformat() if conv.created_at else None,
+            "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
+            "messages": [
+                {
+                    "id": m.id,
+                    "role": m.role,
+                    "content": m.content,
+                    "tokens": m.tokens,
+                    "created_at": m.created_at.isoformat() if m.created_at else None,
+                }
+                for m in messages
+            ],
+        }
+    finally:
+        db.close()
+
+
+@router.patch("/conversations/{conversation_id}")
+async def update_conversation(
+    conversation_id: str = Path(...),
+    title: str = None,
+):
+    """Update a conversation title."""
+    db = get_db()
+    try:
+        conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        if title is not None:
+            conv.title = title
+        db.commit()
+        db.refresh(conv)
+        return {
+            "id": conv.id,
+            "title": conv.title,
+            "model": conv.model,
+            "created_at": conv.created_at.isoformat() if conv.created_at else None,
+            "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
+        }
+    finally:
+        db.close()
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str = Path(...),
+):
+    """Delete a conversation and all its messages."""
+    db = get_db()
+    try:
+        conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        db.delete(conv)
+        db.commit()
+        return {"success": True, "deleted_id": conversation_id}
+    finally:
+        db.close()
+
+
+@router.get("/conversations/{conversation_id}/messages", response_model=dict)
+async def get_conversation_messages(
+    conversation_id: str = Path(...),
+):
+    """Get all messages for a conversation."""
+    db = get_db()
+    try:
+        conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        messages = (
+            db.query(Message)
+            .filter(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.asc())
+            .all()
+        )
+        return {
+            "conversation_id": conv.id,
+            "conversation_title": conv.title,
+            "messages": [
+                {
+                    "id": m.id,
+                    "role": m.role,
+                    "content": m.content,
+                    "tokens": m.tokens,
+                    "created_at": m.created_at.isoformat() if m.created_at else None,
+                }
+                for m in messages
+            ],
+        }
+    finally:
+        db.close()

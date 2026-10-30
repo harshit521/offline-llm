@@ -2,6 +2,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routes.chat import router as chat_router
+from models import init_db
 
 app = FastAPI(title="Offline LLM API")
 app.add_middleware(
@@ -15,8 +16,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register routers only after creating the app
+# Register routers
 app.include_router(chat_router)
+
+# Initialize database on startup
+init_db()
 
 
 @app.get("/")
