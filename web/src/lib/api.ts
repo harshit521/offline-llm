@@ -1,11 +1,25 @@
-import type { ChatMessage, ChatApiResponse, ModelInfo } from '@/types'
+import type {
+  ChatMessage,
+  ChatApiResponse,
+  DownloadProgress,
+  RegisteredModel,
+  RuntimeStatus,
+} from '@/types'
 
-// Backend API URL from environment variables with development fallback
+// Backend API URL from environment variables with development fallback.
+// The frontend never talks to llama.cpp directly.
 export const API_URL =
   import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
 
-export const LLAMA_BASE_URL =
-  import.meta.env.VITE_LLAMA_URL || 'http://127.0.0.1:8080'
+export class ApiError extends Error {
+  status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
 
 /**
  * Transform frontend ChatMessage format to backend API format.
@@ -13,82 +27,54 @@ export const LLAMA_BASE_URL =
  */
 function toBackendMessage(message: ChatMessage): { role: string; content: string } {
   return {
-    role: message.role,
+    role: message.role.toLowerCase(),
     content: message.text,
   }
 }
 
-/**
- * Send a chat message to the backend API (non-streaming).
- * Handles JSON serialization, response parsing, and error handling.
- * Supports optional AbortSignal for cancellation.
- */
-export async function sendChat(
-  messages: ChatMessage[],
-  options: { temperature?: number; max_tokens?: number } = {},
-  signal?: AbortSignal,
-): Promise<ChatApiResponse> {
-  const response = await fetch(`${API_URL}/api/chat`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      messages: messages.map(toBackendMessage),
-      temperature: options.temperature ?? 0.2,
-      max_tokens: options.max_tokens ?? 512,
-    }),
-    signal,
-  })
+async function responseError(response: Response): Promise<ApiError> {
+  let detail = `Backend returned HTTP ${response.status}`
 
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(
-      `Backend returned HTTP ${response.status}: ${errorText}`,
-    )
+  try {
+    const body: unknown = await response.json()
+    if (body && typeof body === 'object' && 'detail' in body) {
+      const raw = (body as { detail: unknown }).detail
+      if (typeof raw === 'string') {
+        detail = raw
+      } else if (Array.isArray(raw)) {
+        detail = raw
+          .map((item) =>
+            item && typeof item === 'object' && 'msg' in item
+              ? String((item as { msg: unknown }).msg)
+              : 'Invalid request',
+          )
+          .join('; ')
+      }
+    }
+  } catch {
+    // Keep the generic status message when the body is not JSON.
   }
 
-  return response.json() as Promise<ChatApiResponse>
+  return new ApiError(response.status, detail)
+}
+
+async function requestJson<T>(
+  path: string,
+  init?: RequestInit,
+): Promise<T> {
+  const response = await fetch(`${API_URL}${path}`, init)
+  if (!response.ok) {
+    throw await responseError(response)
+  }
+  return (await response.json()) as T
 }
 
 /**
- * Send a chat message to the backend API (streaming).
- * Uses SSE (text/event-stream) and returns parsed content chunks.
- * 
- * Example usage:
- *   for await (const delta of sendChatStream(messages)) {
- *     appendDeltaToUI(delta.content);
- *   }
- * 
- * Yields strings of incremental text content.
+ * Read Server-Sent Events and yield each `data:` payload.
  */
-export async function* sendChatStream(
-  messages: ChatMessage[],
-  options: { temperature?: number; max_tokens?: number } = {},
-  signal?: AbortSignal,
-): AsyncGenerator<string> {
-  const response = await fetch(`${API_URL}/api/chat/stream`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      messages: messages.map(toBackendMessage),
-      temperature: options.temperature ?? 0.2,
-      max_tokens: options.max_tokens ?? 512,
-    }),
-    signal,
-  })
-
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(
-      `Backend returned HTTP ${response.status}: ${errorText}`,
-    )
-  }
-
+async function* readSseData(response: Response): AsyncGenerator<string> {
   if (!response.body) {
-    throw new Error('No response body')
+    throw new Error('The backend returned an empty response body.')
   }
 
   const reader = response.body.getReader()
@@ -98,72 +84,205 @@ export async function* sendChatStream(
   try {
     while (true) {
       const { done, value } = await reader.read()
-      
-      if (done) {
-        // Stream completed
-        buffer += value || ''
-        break
-      }
+      if (done) break
 
       buffer += decoder.decode(value, { stream: true })
 
-      // Process complete SSE events from the buffer
-      while (buffer.includes('\n')) {
-        const newlineIdx = buffer.indexOf('\n')
-        const line = buffer.substring(0, newlineIdx).trim()
-        buffer = buffer.substring(newlineIdx + 1).trim()
+      let newline = buffer.indexOf('\n')
+      while (newline >= 0) {
+        const line = buffer.slice(0, newline).replace(/\r$/, '')
+        buffer = buffer.slice(newline + 1)
 
-        if (!line) {
-          continue
+        if (line.startsWith('data:')) {
+          const data = line.slice(5).trimStart()
+          if (data === '[DONE]') return
+          if (data) yield data
         }
 
-        if (line.startsWith('data: ')) {
-          const data = line.substring(6).trim()
-
-          if (data === '[DONE]') {
-            // Stream finished
-            break
-          }
-
-          try {
-            const parsed = JSON.parse(data)
-            if ('content' in parsed && parsed.content !== undefined) {
-              yield parsed.content
-            }
-            // Ignore other payload structures (like error flags for now)
-          } catch (e) {
-            // Skip malformed JSON, continue processing
-            continue
-          }
-        }
-        // Ignore non-data lines (id, event, retry)
+        newline = buffer.indexOf('\n')
       }
     }
+
+    // Flush a final line that did not end with a newline.
+    const tail = buffer.trim()
+    if (tail.startsWith('data:')) {
+      const data = tail.slice(5).trimStart()
+      if (data && data !== '[DONE]') yield data
+    }
   } finally {
-    reader.cancel()
+    void reader.cancel().catch(() => undefined)
   }
 }
 
+export interface ChatOptions {
+  temperature?: number
+  max_tokens?: number
+  model_id?: string
+}
+
 /**
- * List models available from the configured llama.cpp server
- * via the backend proxy endpoint.
+ * Send a chat message to the backend API (non-streaming).
  */
-export async function listModels(): Promise<ModelInfo[]> {
-  const response = await fetch(`${API_URL}/api/chat/models`)
+export async function sendChat(
+  messages: ChatMessage[],
+  options: ChatOptions = {},
+  signal?: AbortSignal,
+): Promise<ChatApiResponse> {
+  return requestJson<ChatApiResponse>('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      messages: messages.map(toBackendMessage),
+      temperature: options.temperature ?? 0.2,
+      max_tokens: options.max_tokens ?? 512,
+      model_id: options.model_id,
+    }),
+    signal,
+  })
+}
+
+/**
+ * Send a chat message and yield incremental text chunks as they arrive.
+ */
+export async function* sendChatStream(
+  messages: ChatMessage[],
+  options: ChatOptions = {},
+  signal?: AbortSignal,
+): AsyncGenerator<string> {
+  const response = await fetch(`${API_URL}/api/chat/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      messages: messages.map(toBackendMessage),
+      temperature: options.temperature ?? 0.2,
+      max_tokens: options.max_tokens ?? 512,
+      model_id: options.model_id,
+    }),
+    signal,
+  })
 
   if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(
-      `Backend returned HTTP ${response.status}: ${errorText}`,
-    )
+    throw await responseError(response)
   }
 
-  const data = await response.json()
-  const list = data.data || []
+  for await (const data of readSseData(response)) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(data)
+    } catch {
+      continue
+    }
 
-  return list.map((item: { id?: string; name?: string }) => ({
-    id: item.id || item.name || 'unknown',
-    name: item.id || item.name || 'Local GGUF model',
-    status: 'AVAILABLE',
-  }))
+    if (parsed && typeof parsed === 'object') {
+      if ('error' in parsed) {
+        throw new Error(String((parsed as { error: unknown }).error))
+      }
+      if (
+        'content' in parsed &&
+        typeof (parsed as { content: unknown }).content === 'string'
+      ) {
+        yield (parsed as { content: string }).content
+      }
+    }
+  }
+}
+
+/** List models registered in the backend registry. */
+export async function listModels(): Promise<RegisteredModel[]> {
+  return requestJson<RegisteredModel[]>('/api/models')
+}
+
+/** Register an existing GGUF file inside the backend models directory. */
+export async function registerModel(payload: {
+  path: string
+  name?: string
+  context?: number
+}): Promise<RegisteredModel> {
+  return requestJson<RegisteredModel>('/api/models', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+/**
+ * Download a GGUF file from Hugging Face, streaming real progress updates.
+ */
+export async function downloadModel(
+  repoId: string,
+  filename: string,
+  context: number | undefined,
+  onProgress: (progress: DownloadProgress) => void,
+  signal?: AbortSignal,
+): Promise<DownloadProgress> {
+  const response = await fetch(`${API_URL}/api/models/download`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ repo_id: repoId, filename, context }),
+    signal,
+  })
+
+  if (!response.ok) {
+    throw await responseError(response)
+  }
+
+  let latest: DownloadProgress | null = null
+
+  for await (const data of readSseData(response)) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(data)
+    } catch {
+      continue
+    }
+
+    const progress = parsed as DownloadProgress
+    if (!progress || typeof progress.status !== 'string') continue
+
+    latest = progress
+    onProgress(progress)
+
+    if (progress.status === 'completed') return progress
+    if (progress.status === 'failed' || progress.status === 'cancelled') {
+      throw new Error(progress.error || 'Download failed.')
+    }
+  }
+
+  if (!latest) {
+    throw new Error('The download stream ended without progress updates.')
+  }
+
+  if (latest.status === 'completed') return latest
+
+  throw new Error(latest.error || 'The download stream ended unexpectedly.')
+}
+
+/** Delete a model from the registry and remove its file from disk. */
+export async function deleteModel(
+  id: string,
+): Promise<{ success: boolean; deleted_id: string; file_removed: boolean }> {
+  return requestJson('/api/models/' + encodeURIComponent(id), {
+    method: 'DELETE',
+  })
+}
+
+/** Start a managed llama-server for a registered model. */
+export async function loadModel(id: string): Promise<RuntimeStatus> {
+  return requestJson<RuntimeStatus>(
+    `/api/models/${encodeURIComponent(id)}/load`,
+    { method: 'POST' },
+  )
+}
+
+/** Stop the managed llama-server for a registered model. */
+export async function unloadModel(id: string): Promise<RuntimeStatus> {
+  return requestJson<RuntimeStatus>(
+    `/api/models/${encodeURIComponent(id)}/unload`,
+    { method: 'POST' },
+  )
+}
+
+/** Current managed runtime state plus external-server reachability. */
+export async function getRuntimeStatus(): Promise<RuntimeStatus> {
+  return requestJson<RuntimeStatus>('/api/models/runtime')
 }

@@ -1,4 +1,5 @@
-import { useRef, useState, useCallback } from 'react'
+import { useRef, useState, useEffect } from 'react'
+import { Link } from 'react-router-dom'
 import {
   Paperclip,
   Play,
@@ -10,21 +11,116 @@ import {
   ChevronDown,
 } from 'lucide-react'
 
-import { sendChat, sendChatStream } from '@/lib/api'
-import type { ChatMessage } from '@/types'
+import {
+  getRuntimeStatus,
+  listModels,
+  loadModel,
+  sendChatStream,
+  unloadModel,
+} from '@/lib/api'
+import type { ChatMessage, RegisteredModel, RuntimeStatus } from '@/types'
 import { MessageContent } from '@/components/chat/MessageContent'
 import { usePersistedSettings } from '@/store/settingsStore'
 
-const MODEL_NAME = 'Qwen3.5 0.8B (GGUF)'
+const SELECTED_MODEL_KEY = 'offline-llm-selected-model'
 
 export function ChatWorkspace() {
+  const { temperature, maxTokens } = usePersistedSettings()
+
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [generating, setGenerating] = useState(false)
-  const [model, setModel] = useState(MODEL_NAME)
+  const [preparing, setPreparing] = useState(false)
+  const [models, setModels] = useState<RegisteredModel[]>([])
+  const [selectedModelId, setSelectedModelId] = useState('')
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null)
+  const [registryLoaded, setRegistryLoaded] = useState(false)
   const [error, setError] = useState('')
 
   const abortControllerRef = useRef<AbortController | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+
+    const loadRegistry = async () => {
+      try {
+        const [registered, status] = await Promise.all([
+          listModels(),
+          getRuntimeStatus(),
+        ])
+        if (cancelled) return
+
+        setModels(registered)
+        setRuntime(status)
+
+        const stored = localStorage.getItem(SELECTED_MODEL_KEY)
+        const next =
+          registered.find((model) => model.id === stored)?.id ??
+          registered[0]?.id ??
+          ''
+        setSelectedModelId(next)
+      } catch (err) {
+        if (!cancelled) {
+          setError(
+            err instanceof Error
+              ? err.message
+              : 'Could not load the model registry.',
+          )
+        }
+      } finally {
+        if (!cancelled) setRegistryLoaded(true)
+      }
+    }
+
+    void loadRegistry()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const selectModel = (id: string) => {
+    setSelectedModelId(id)
+    if (id) localStorage.setItem(SELECTED_MODEL_KEY, id)
+    else localStorage.removeItem(SELECTED_MODEL_KEY)
+  }
+
+  const selectedModel =
+    models.find((model) => model.id === selectedModelId) ?? null
+
+  /**
+   * Make sure the model chosen in the UI is the one llama-server is serving.
+   * Switching models unloads the previous managed instance first.
+   */
+  const ensureModelLoaded = async (): Promise<void> => {
+    if (!selectedModelId) {
+      throw new Error(
+        'No model is selected. Download or register a model on the Models page first.',
+      )
+    }
+
+    const status = await getRuntimeStatus()
+    setRuntime(status)
+
+    if (status.status === 'running' && status.model_id === selectedModelId) {
+      return
+    }
+
+    if (status.status === 'starting' || status.status === 'stopping') {
+      throw new Error('A model is starting or stopping. Try again shortly.')
+    }
+
+    if (status.status === 'running' && status.model_id) {
+      await unloadModel(status.model_id)
+    }
+
+    setPreparing(true)
+    try {
+      const loaded = await loadModel(selectedModelId)
+      setRuntime(loaded)
+    } finally {
+      setPreparing(false)
+    }
+  }
 
   const send = async (
     promptOverride?: string,
@@ -62,20 +158,22 @@ export function ChatWorkspace() {
     abortControllerRef.current = controller
 
     try {
-      // Use streaming API to receive tokens as they're generated
-      const contentChunks: string[] = []
+      // Make sure the selected model is the one actually serving requests.
+      await ensureModelLoaded()
 
-      const { temperature, maxTokens } = usePersistedSettings()
+      const contentChunks: string[] = []
 
       for await (const delta of sendChatStream(
         nextMessages,
-        { temperature, max_tokens: maxTokens },
+        {
+          temperature,
+          max_tokens: maxTokens,
+          model_id: selectedModelId,
+        },
         controller.signal,
       )) {
-        // Append each delta to the content chunks array
         contentChunks.push(delta)
 
-        // Update the last message with accumulated content
         setMessages((current) => {
           const updated = [...current]
           const last = updated.length - 1
@@ -92,7 +190,6 @@ export function ChatWorkspace() {
       }
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {
-        // User cancelled generation - update UI to reflect stopped state
         setMessages((current) => {
           const updated = [...current]
           const last = updated.length - 1
@@ -107,13 +204,24 @@ export function ChatWorkspace() {
           return updated
         })
       } else {
-        // Other error
         setError(
-          err instanceof Error ? err.message : 'An unknown error occurred.'
+          err instanceof Error ? err.message : 'An unknown error occurred.',
         )
+        setMessages((current) => {
+          const last = current.length - 1
+          if (
+            last >= 0 &&
+            current[last].role === 'ASSISTANT' &&
+            !current[last].text
+          ) {
+            return current.slice(0, last)
+          }
+          return current
+        })
       }
     } finally {
       abortControllerRef.current = null
+      setPreparing(false)
       setGenerating(false)
     }
   }
@@ -175,17 +283,35 @@ export function ChatWorkspace() {
             <h1 className="mt-2 text-xl font-semibold tracking-tight">
               Untitled Session
             </h1>
+
+            <div className="mt-1 mono text-[10px] text-[var(--muted)]">
+              {selectedModel
+                ? `${selectedModel.quant} · ${selectedModel.context.toLocaleString()} ctx`
+                : 'No model selected'}
+              {runtime?.status === 'running' &&
+              runtime.model_id === selectedModelId
+                ? ' · LOADED'
+                : ''}
+            </div>
           </div>
 
           <div className="flex items-center gap-2">
             <div className="relative">
               <select
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
-                disabled={generating}
-                className="appearance-none border rule bg-transparent py-2 pl-3 pr-8 mono text-[11px] outline-none disabled:opacity-50"
+                value={selectedModelId}
+                onChange={(event) => selectModel(event.target.value)}
+                disabled={generating || preparing || models.length === 0}
+                className="max-w-[240px] appearance-none truncate border rule bg-transparent py-2 pl-3 pr-8 mono text-[11px] outline-none disabled:opacity-50"
               >
-                <option value={model}>{model}</option>
+                {models.length === 0 ? (
+                  <option value="">No models registered</option>
+                ) : (
+                  models.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.name} · {model.quant}
+                    </option>
+                  ))
+                )}
               </select>
 
               <ChevronDown
@@ -197,7 +323,7 @@ export function ChatWorkspace() {
             <button
               title="Clear conversation"
               onClick={clearConversation}
-              disabled={generating}
+              disabled={generating || preparing}
               className="grid h-8 w-8 place-items-center border rule text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-50"
             >
               <Trash2 size={14} />
@@ -214,6 +340,16 @@ export function ChatWorkspace() {
           </div>
         </div>
       </header>
+
+      {registryLoaded && models.length === 0 && (
+        <div className="border-b rule bg-[var(--surface)] px-7 py-3 text-xs text-[var(--muted)] lg:px-9">
+          No models registered. Open the{' '}
+          <Link to="/models" className="underline">
+            Models
+          </Link>{' '}
+          page to download or register a GGUF file.
+        </div>
+      )}
 
       <section className="flex-1 px-7 py-10 lg:px-14">
         {messages.length === 0 ? (
@@ -260,7 +396,7 @@ export function ChatWorkspace() {
 
                 {generating && message.role === 'ASSISTANT' && !message.text && (
                   <div className="mt-5 text-sm text-[var(--muted)]">
-                    Generating...
+                    {preparing ? 'Loading model…' : 'Generating...'}
                   </div>
                 )}
               </article>
@@ -268,9 +404,9 @@ export function ChatWorkspace() {
 
             {generating && (
               <div className="mt-6 mono text-[10px] text-[var(--accent)]">
-                {model} ·{' '}
+                {selectedModel?.name ?? 'No model'} ·{' '}
                 <span className="inline-block animate-pulse">
-                  ● GENERATING
+                  {preparing ? 'LOADING MODEL' : '● GENERATING'}
                 </span>
               </div>
             )}

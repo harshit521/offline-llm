@@ -1,22 +1,3 @@
-export const conversations = [
-  {
-    id: 'conv-1',
-    title: 'Getting started with Qwen',
-    preview: 'Hello! Introduce yourself.',
-    time: 'Today',
-    messages: 2,
-    model: 'Qwen3.5 0.8B (GGUF)',
-  },
-  {
-    id: 'conv-2',
-    title: 'Code assistance',
-    preview: 'Help me understand this function.',
-    time: 'Yesterday',
-    messages: 4,
-    model: 'Qwen3.5 0.8B (GGUF)',
-  },
-]
-
 export const documents = [
   {
     id: 'doc-1',

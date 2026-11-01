@@ -1,12 +1,12 @@
 import json
-import os
 import uuid
-from fastapi import APIRouter, HTTPException, Path, Depends
+from fastapi import APIRouter, HTTPException, Path
 from pydantic import BaseModel, Field
 import httpx
 
-from llama_client import chat, stream_chat, LLAMA_BASE_URL
-from models import Conversation, Message, get_db, init_db
+from llama_client import chat, stream_chat, get_base_url
+from models import Conversation, Message, get_db
+from runtime import runtime_manager
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -15,10 +15,39 @@ class ChatRequest(BaseModel):
     messages: list[dict] = Field(min_length=1)
     temperature: float = Field(default=0.2, ge=0, le=2)
     max_tokens: int = Field(default=512, ge=1, le=2048)
+    model_id: str | None = Field(default=None, max_length=200)
+
+
+def _ensure_model_ready(model_id: str | None) -> None:
+    """Reject requests that target a model other than the managed runtime.
+
+    When no managed runtime is active the request is forwarded to the
+    externally supervised llama-server, preserving the pre-Phase-3 setup.
+    """
+    if not model_id:
+        return
+
+    snapshot = runtime_manager.snapshot()
+    status = snapshot.get("status")
+
+    if status in {"starting", "stopping"}:
+        raise HTTPException(
+            status_code=409,
+            detail="A model is starting or stopping. Try again shortly.",
+        )
+
+    loaded_id = snapshot.get("model_id")
+    if status == "running" and loaded_id and loaded_id != model_id:
+        raise HTTPException(
+            status_code=409,
+            detail="The selected model is not loaded. Load it in the Models page first.",
+        )
+
 
 
 @router.post("")
 async def create_chat(request: ChatRequest):
+    _ensure_model_ready(request.model_id)
     try:
         return await chat(
             messages=request.messages,
@@ -40,6 +69,7 @@ async def create_chat(request: ChatRequest):
 @router.post("/stream")
 async def create_chat_stream(request: ChatRequest):
     """Streaming chat endpoint that returns SSE events."""
+    _ensure_model_ready(request.model_id)
 
     async def event_generator():
         async for chunk in stream_chat(
@@ -70,10 +100,11 @@ async def create_chat_stream(request: ChatRequest):
 @router.get("/health")
 async def health():
     """Check backend and llama-server status."""
+    base_url = get_base_url()
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             llama_health = await client.get(
-                f"{LLAMA_BASE_URL}/health"
+                f"{base_url}/health"
             )
             llama_ok = llama_health.status_code == 200
     except Exception:
@@ -82,13 +113,19 @@ async def health():
     return {
         "status": "ok" if llama_ok else "unavailable",
         "llama_server_reachable": llama_ok,
+        "llama_base_url": base_url,
+        "managed_runtime": runtime_manager.snapshot().get("status") == "running",
         "service": "offline-llm-api",
     }
 
 
 @router.get("/models")
 async def list_models():
-    """List models from the configured llama.cpp server."""
+    """List models from the active llama.cpp server.
+
+    Kept for backwards compatibility. The Phase 3 registry lives at
+    ``GET /api/models``.
+    """
     async with httpx.AsyncClient(timeout=httpx.Timeout(
         connect=5.0,
         read=10.0,
@@ -97,7 +134,7 @@ async def list_models():
     )) as client:
         try:
             response = await client.get(
-                f"{LLAMA_BASE_URL}/v1/models"
+                f"{get_base_url()}/v1/models"
             )
             if response.status_code == 200:
                 data = response.json()

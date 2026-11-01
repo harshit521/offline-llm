@@ -1,4 +1,3 @@
-import React from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
@@ -29,17 +28,23 @@ export function MessageContent({
   }
 
   return (
-    <div className="prose-local whitespace-pre-wrap text-[15px] leading-7">
+    <div
+      className={
+        className ??
+        'prose-local whitespace-pre-wrap text-[15px] leading-7'
+      }
+    >
       <ReactMarkdown
-        // @ts-ignore - ReactMarkdown component props
+        remarkPlugins={[remarkGfm]}
         components={{
-          code({ className, children }) {
+          code({ className: codeClassName, children }) {
             return (
               <pre
-                className={className}
+                className={codeClassName}
                 style={{
                   overflowX: 'auto',
-                  fontFamily: '"SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
+                  fontFamily:
+                    '"SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
                   fontSize: '12px',
                   padding: '12px',
                   background: 'var(--surface-2)',
@@ -47,14 +52,22 @@ export function MessageContent({
                   margin: 0,
                 }}
               >
-                <code style={{ color: 'var(--text)', fontSize: '12px', display: 'block' }}>
+                <code
+                  style={{
+                    color: 'var(--text)',
+                    fontSize: '12px',
+                    display: 'block',
+                  }}
+                >
                   {children}
                 </code>
               </pre>
             )
           },
         }}
-      />
+      >
+        {content}
+      </ReactMarkdown>
     </div>
   )
 }

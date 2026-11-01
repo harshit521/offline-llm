@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import {
   Activity,
   Database,
@@ -8,6 +9,8 @@ import {
 } from 'lucide-react'
 
 import { PageHeader } from '@/components/ui/PageHeader'
+import { getRuntimeStatus } from '@/lib/api'
+import type { RuntimeStatus } from '@/types'
 
 const metrics = [
   ['CPU', '32%'],
@@ -18,6 +21,27 @@ const metrics = [
 ]
 
 export default function System() {
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+
+    const refresh = () => {
+      getRuntimeStatus()
+        .then((status) => {
+          if (!cancelled) setRuntime(status)
+        })
+        .catch(() => undefined)
+    }
+
+    refresh()
+    const timer = window.setInterval(refresh, 5000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [])
+
   return (
     <div>
       <PageHeader
@@ -32,8 +56,12 @@ export default function System() {
           {[
             [
               'INFERENCE ENGINE',
-              'OLLAMA',
-              'RUNNING',
+              'LLAMA.CPP',
+              runtime?.managed
+                ? 'MANAGED'
+                : runtime?.reachable
+                  ? 'EXTERNAL'
+                  : 'OFFLINE',
               Server,
             ],
             [
@@ -50,8 +78,8 @@ export default function System() {
             ],
             [
               'MODEL',
-              'QWEN3 8B',
-              'LOADED',
+              runtime?.model_name ?? 'NONE',
+              runtime?.status === 'running' ? 'LOADED' : 'NOT LOADED',
               Cpu,
             ],
             [
@@ -143,7 +171,7 @@ export default function System() {
               <br />
               ↓
               <br />
-              OLLAMA
+              LLAMA.CPP
               <br />
               ↓
               <br />

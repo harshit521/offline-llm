@@ -1,10 +1,14 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   ShieldCheck,
   Trash2,
 } from 'lucide-react'
 
 import { PageHeader } from '@/components/ui/PageHeader'
+import { listModels } from '@/lib/api'
+import type { RegisteredModel } from '@/types'
+
+const SELECTED_MODEL_KEY = 'offline-llm-selected-model'
 
 function Row({
   label,
@@ -26,6 +30,30 @@ export default function Settings() {
   const [temp, setTemp] = useState(0.7)
   const [top, setTop] = useState(0.9)
   const [max, setMax] = useState(2048)
+  const [models, setModels] = useState<RegisteredModel[]>([])
+  const [defaultModel, setDefaultModel] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    listModels()
+      .then((registered) => {
+        if (cancelled) return
+        setModels(registered)
+        const stored = localStorage.getItem(SELECTED_MODEL_KEY)
+        setDefaultModel(
+          registered.find((model) => model.id === stored)?.id ??
+            registered[0]?.id ??
+            '',
+        )
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const selectedModel =
+    models.find((model) => model.id === defaultModel) ?? null
 
   return (
     <div>
@@ -49,9 +77,28 @@ export default function Settings() {
           </Row>
 
           <Row label="Default model">
-            <select className="border rule bg-transparent px-3 py-2 mono text-xs">
-              <option>Qwen3 8B</option>
-              <option>Llama 3</option>
+            <select
+              value={defaultModel}
+              onChange={(event) => {
+                setDefaultModel(event.target.value)
+                if (event.target.value) {
+                  localStorage.setItem(SELECTED_MODEL_KEY, event.target.value)
+                } else {
+                  localStorage.removeItem(SELECTED_MODEL_KEY)
+                }
+              }}
+              disabled={models.length === 0}
+              className="max-w-[240px] border rule bg-transparent px-3 py-2 mono text-xs disabled:opacity-50"
+            >
+              {models.length === 0 ? (
+                <option value="">No models registered</option>
+              ) : (
+                models.map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {model.name}
+                  </option>
+                ))
+              )}
             </select>
           </Row>
 
@@ -123,7 +170,9 @@ export default function Settings() {
 
           <Row label="Context length">
             <span className="mono text-xs">
-              32,768
+              {selectedModel
+                ? selectedModel.context.toLocaleString()
+                : '—'}
             </span>
           </Row>
         </section>

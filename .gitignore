@@ -57,6 +57,10 @@ htmlcov/
 *.sqlite
 *.sqlite3
 
+# Downloaded GGUF models and managed llama-server logs (large / local)
+api/models/
+api/logs/
+
 # =========================
 # Secrets / certificates
 # =========================
