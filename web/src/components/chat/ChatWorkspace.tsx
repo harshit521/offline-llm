@@ -1,43 +1,78 @@
 import { useRef, useState, useEffect } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import {
   Paperclip,
   Play,
   Square,
   Copy,
   RotateCcw,
-  Trash2,
+  Plus,
   Download,
   ChevronDown,
 } from 'lucide-react'
 
 import {
+  createConversation,
+  getConversation,
   getRuntimeStatus,
   listModels,
   loadModel,
+  sendChat,
   sendChatStream,
   unloadModel,
 } from '@/lib/api'
 import type { ChatMessage, RegisteredModel, RuntimeStatus } from '@/types'
 import { MessageContent } from '@/components/chat/MessageContent'
-import { usePersistedSettings } from '@/store/settingsStore'
+import {
+  getSettings,
+  updateSettings,
+  useSettings,
+} from '@/store/settingsStore'
 
-const SELECTED_MODEL_KEY = 'offline-llm-selected-model'
+const TITLE_MAX_LENGTH = 60
+
+function formatMessageTime(value: string | null): string {
+  if (!value) {
+    return new Date().toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+  }
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+
+  return date.toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function deriveTitle(text: string): string {
+  const cleaned = text.replace(/\s+/g, ' ').trim()
+  if (!cleaned) return 'New Conversation'
+  if (cleaned.length <= TITLE_MAX_LENGTH) return cleaned
+  return `${cleaned.slice(0, TITLE_MAX_LENGTH - 1).trimEnd()}…`
+}
 
 export function ChatWorkspace() {
-  const { temperature, maxTokens } = usePersistedSettings()
+  const settings = useSettings()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const conversationId = searchParams.get('conversation') ?? ''
 
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [generating, setGenerating] = useState(false)
   const [preparing, setPreparing] = useState(false)
   const [models, setModels] = useState<RegisteredModel[]>([])
-  const [selectedModelId, setSelectedModelId] = useState('')
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null)
   const [registryLoaded, setRegistryLoaded] = useState(false)
+  const [conversationTitle, setConversationTitle] = useState('')
+  const [loadingConversation, setLoadingConversation] = useState(false)
   const [error, setError] = useState('')
 
   const abortControllerRef = useRef<AbortController | null>(null)
+  const skipNextLoadRef = useRef<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -53,12 +88,14 @@ export function ChatWorkspace() {
         setModels(registered)
         setRuntime(status)
 
-        const stored = localStorage.getItem(SELECTED_MODEL_KEY)
+        const preferred = getSettings().defaultModelId
         const next =
-          registered.find((model) => model.id === stored)?.id ??
+          registered.find((model) => model.id === preferred)?.id ??
           registered[0]?.id ??
           ''
-        setSelectedModelId(next)
+        if (next !== preferred) {
+          updateSettings({ defaultModelId: next })
+        }
       } catch (err) {
         if (!cancelled) {
           setError(
@@ -78,21 +115,75 @@ export function ChatWorkspace() {
     }
   }, [])
 
+  // Restore the conversation referenced by /workspace?conversation=<id>.
+  useEffect(() => {
+    let cancelled = false
+
+    if (!conversationId) {
+      setMessages([])
+      setConversationTitle('')
+      setLoadingConversation(false)
+      return () => {
+        cancelled = true
+      }
+    }
+
+    // The first send creates a conversation and updates the URL. Its messages
+    // are already on screen, so skip the redundant fetch for that id.
+    if (skipNextLoadRef.current === conversationId) {
+      skipNextLoadRef.current = null
+      return () => {
+        cancelled = true
+      }
+    }
+
+    setLoadingConversation(true)
+    setError('')
+
+    getConversation(conversationId)
+      .then((conversation) => {
+        if (cancelled) return
+        setConversationTitle(conversation.title)
+        setMessages(
+          conversation.messages.map((message) => ({
+            role: message.role === 'assistant' ? 'ASSISTANT' : 'USER',
+            text: message.content,
+            time: formatMessageTime(message.created_at),
+          })),
+        )
+      })
+      .catch((err) => {
+        if (cancelled) return
+        setError(
+          err instanceof Error
+            ? err.message
+            : 'Could not load the conversation.',
+        )
+        setMessages([])
+        setConversationTitle('')
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingConversation(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [conversationId])
+
   const selectModel = (id: string) => {
-    setSelectedModelId(id)
-    if (id) localStorage.setItem(SELECTED_MODEL_KEY, id)
-    else localStorage.removeItem(SELECTED_MODEL_KEY)
+    updateSettings({ defaultModelId: id })
   }
 
   const selectedModel =
-    models.find((model) => model.id === selectedModelId) ?? null
+    models.find((model) => model.id === settings.defaultModelId) ?? null
 
   /**
    * Make sure the model chosen in the UI is the one llama-server is serving.
    * Switching models unloads the previous managed instance first.
    */
   const ensureModelLoaded = async (): Promise<void> => {
-    if (!selectedModelId) {
+    if (!settings.defaultModelId) {
       throw new Error(
         'No model is selected. Download or register a model on the Models page first.',
       )
@@ -101,7 +192,10 @@ export function ChatWorkspace() {
     const status = await getRuntimeStatus()
     setRuntime(status)
 
-    if (status.status === 'running' && status.model_id === selectedModelId) {
+    if (
+      status.status === 'running' &&
+      status.model_id === settings.defaultModelId
+    ) {
       return
     }
 
@@ -115,7 +209,7 @@ export function ChatWorkspace() {
 
     setPreparing(true)
     try {
-      const loaded = await loadModel(selectedModelId)
+      const loaded = await loadModel(settings.defaultModelId)
       setRuntime(loaded)
     } finally {
       setPreparing(false)
@@ -125,10 +219,16 @@ export function ChatWorkspace() {
   const send = async (
     promptOverride?: string,
     historyOverride?: ChatMessage[],
+    mode: 'normal' | 'regenerate' = 'normal',
   ) => {
     const prompt = (promptOverride ?? input).trim()
 
     if (!prompt || generating) return
+
+    if (mode === 'regenerate' && !conversationId) {
+      setError('Cannot regenerate without a saved conversation.')
+      return
+    }
 
     const now = new Date().toLocaleTimeString([], {
       hour: '2-digit',
@@ -161,18 +261,59 @@ export function ChatWorkspace() {
       // Make sure the selected model is the one actually serving requests.
       await ensureModelLoaded()
 
-      const contentChunks: string[] = []
+      // A new workspace has no id yet. Create the row before the first turn so
+      // the URL, the header, and the backend all agree on the conversation.
+      let activeConversationId = conversationId
+      if (!activeConversationId) {
+        const conversation = await createConversation({
+          model: selectedModel?.name,
+        })
+        activeConversationId = conversation.id
+        skipNextLoadRef.current = conversation.id
+        setConversationTitle(deriveTitle(prompt))
+        setSearchParams({ conversation: conversation.id }, { replace: true })
+      }
 
-      for await (const delta of sendChatStream(
-        nextMessages,
-        {
-          temperature,
-          max_tokens: maxTokens,
-          model_id: selectedModelId,
-        },
-        controller.signal,
-      )) {
-        contentChunks.push(delta)
+      const requestOptions = {
+        temperature: settings.temperature,
+        max_tokens: settings.maxTokens,
+        top_p: settings.topP,
+        model_id: settings.defaultModelId,
+        conversation_id: activeConversationId,
+        persist_user_message: mode !== 'regenerate',
+        replace_last_assistant: mode === 'regenerate',
+      }
+
+      if (settings.streaming) {
+        const contentChunks: string[] = []
+
+        for await (const delta of sendChatStream(
+          nextMessages,
+          requestOptions,
+          controller.signal,
+        )) {
+          contentChunks.push(delta)
+
+          setMessages((current) => {
+            const updated = [...current]
+            const last = updated.length - 1
+
+            if (last >= 0 && updated[last].role === 'ASSISTANT') {
+              updated[last] = {
+                ...updated[last],
+                text: contentChunks.join(''),
+              }
+            }
+
+            return updated
+          })
+        }
+      } else {
+        const result = await sendChat(
+          nextMessages,
+          requestOptions,
+          controller.signal,
+        )
 
         setMessages((current) => {
           const updated = [...current]
@@ -181,7 +322,7 @@ export function ChatWorkspace() {
           if (last >= 0 && updated[last].role === 'ASSISTANT') {
             updated[last] = {
               ...updated[last],
-              text: contentChunks.join(''),
+              text: result.content,
             }
           }
 
@@ -245,12 +386,15 @@ export function ChatWorkspace() {
     if (userMessage?.role !== 'USER') return
 
     const history = messages.slice(0, userIndex)
-    void send(userMessage.text, history)
+    void send(userMessage.text, history, 'regenerate')
   }
 
-  const clearConversation = () => {
-    if (generating) return
+  const startNewChat = () => {
+    if (generating || preparing) return
+    setSearchParams({}, { replace: true })
     setMessages([])
+    setConversationTitle('')
+    setInput('')
     setError('')
   }
 
@@ -281,7 +425,8 @@ export function ChatWorkspace() {
             </div>
 
             <h1 className="mt-2 text-xl font-semibold tracking-tight">
-              Untitled Session
+              {conversationTitle ||
+                (loadingConversation ? 'Loading…' : 'New Session')}
             </h1>
 
             <div className="mt-1 mono text-[10px] text-[var(--muted)]">
@@ -289,7 +434,7 @@ export function ChatWorkspace() {
                 ? `${selectedModel.quant} · ${selectedModel.context.toLocaleString()} ctx`
                 : 'No model selected'}
               {runtime?.status === 'running' &&
-              runtime.model_id === selectedModelId
+              runtime.model_id === settings.defaultModelId
                 ? ' · LOADED'
                 : ''}
             </div>
@@ -298,7 +443,7 @@ export function ChatWorkspace() {
           <div className="flex items-center gap-2">
             <div className="relative">
               <select
-                value={selectedModelId}
+                value={settings.defaultModelId}
                 onChange={(event) => selectModel(event.target.value)}
                 disabled={generating || preparing || models.length === 0}
                 className="max-w-[240px] appearance-none truncate border rule bg-transparent py-2 pl-3 pr-8 mono text-[11px] outline-none disabled:opacity-50"
@@ -321,12 +466,13 @@ export function ChatWorkspace() {
             </div>
 
             <button
-              title="Clear conversation"
-              onClick={clearConversation}
+              title="New chat"
+              onClick={startNewChat}
               disabled={generating || preparing}
-              className="grid h-8 w-8 place-items-center border rule text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-50"
+              className="flex h-8 items-center gap-2 border rule px-3 text-[10px] uppercase tracking-wider text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-50"
             >
-              <Trash2 size={14} />
+              <Plus size={13} />
+              <span className="hidden sm:inline">New chat</span>
             </button>
 
             <button
@@ -352,7 +498,11 @@ export function ChatWorkspace() {
       )}
 
       <section className="flex-1 px-7 py-10 lg:px-14">
-        {messages.length === 0 ? (
+        {loadingConversation ? (
+          <p className="mx-auto max-w-3xl pt-12 text-sm text-[var(--muted)]">
+            Loading conversation…
+          </p>
+        ) : messages.length === 0 ? (
           <Empty />
         ) : (
           <div className="mx-auto max-w-3xl">

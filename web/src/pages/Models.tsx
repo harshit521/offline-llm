@@ -24,8 +24,7 @@ import {
   unloadModel,
 } from '@/lib/api'
 import type { DownloadProgress, RegisteredModel, RuntimeStatus } from '@/types'
-
-const SELECTED_MODEL_KEY = 'offline-llm-selected-model'
+import { getSettings, setDefaultModelId } from '@/store/settingsStore'
 
 function formatBytes(bytes: number): string {
   if (!bytes) return '0 B'
@@ -102,7 +101,7 @@ export default function Models() {
     try {
       const status = await loadModel(model.id)
       setRuntime(status)
-      localStorage.setItem(SELECTED_MODEL_KEY, model.id)
+      setDefaultModelId(model.id)
       await refresh(false)
     } catch (err) {
       setError(errorMessage(err, 'Could not load the model.'))
@@ -135,8 +134,8 @@ export default function Models() {
     setError('')
     try {
       await deleteModel(model.id)
-      if (localStorage.getItem(SELECTED_MODEL_KEY) === model.id) {
-        localStorage.removeItem(SELECTED_MODEL_KEY)
+      if (getSettings().defaultModelId === model.id) {
+        setDefaultModelId('')
       }
       await refresh(false)
     } catch (err) {
@@ -147,7 +146,7 @@ export default function Models() {
   }
 
   const useInChat = (model: RegisteredModel) => {
-    localStorage.setItem(SELECTED_MODEL_KEY, model.id)
+    setDefaultModelId(model.id)
     navigate('/workspace')
   }
 
@@ -196,7 +195,7 @@ export default function Models() {
       )
       setProgress(result)
       if (result.model_id) {
-        localStorage.setItem(SELECTED_MODEL_KEY, result.model_id)
+        setDefaultModelId(result.model_id)
       }
       await refresh(false)
     } catch (err) {
@@ -222,7 +221,7 @@ export default function Models() {
         name: displayName.trim() || undefined,
         context: ctx,
       })
-      localStorage.setItem(SELECTED_MODEL_KEY, model.id)
+      setDefaultModelId(model.id)
       await refresh(false)
       setOpen(false)
       resetForm()

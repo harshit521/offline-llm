@@ -11,22 +11,11 @@ touch the developer's real registry or start a real llama-server.
 from __future__ import annotations
 
 import os
-import shutil
-import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-API_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(API_DIR))
-
-_TMP = tempfile.mkdtemp(prefix="offline-llm-tests-")
-os.environ["DATABASE_URL"] = f"sqlite:///{_TMP}/test.sqlite"
-os.environ["MODELS_DIR"] = f"{_TMP}/models"
-os.environ["MODEL_LOG_DIR"] = f"{_TMP}/logs"
-os.environ["LLAMA_SERVER_BIN"] = "/nonexistent/llama-server"
-os.environ["MODEL_LOAD_TIMEOUT"] = "2"
+import support  # noqa: F401  (sets up env before app imports)
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -54,7 +43,6 @@ class ModelsApiTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls.client.__exit__(None, None, None)
-        shutil.rmtree(_TMP, ignore_errors=True)
 
     def setUp(self) -> None:
         db = get_db()

@@ -70,12 +70,13 @@ def _message_text(message: dict) -> str:
     return ""
 
 
-async def chat(messages, temperature=0.2, max_tokens=512):
+async def chat(messages, temperature=0.2, max_tokens=512, top_p=0.9):
     """Non-streaming chat completion."""
     payload = {
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "top_p": top_p,
         "stream": False,
     }
 
@@ -98,7 +99,7 @@ async def chat(messages, temperature=0.2, max_tokens=512):
     }
 
 
-async def stream_chat(messages, temperature=0.2, max_tokens=512):
+async def stream_chat(messages, temperature=0.2, max_tokens=512, top_p=0.9):
     """Async generator that streams chat completions from llama.cpp.
 
     Yields dicts with either ``{"content": "delta_text"}``,
@@ -108,6 +109,7 @@ async def stream_chat(messages, temperature=0.2, max_tokens=512):
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "top_p": top_p,
         "stream": True,
     }
 

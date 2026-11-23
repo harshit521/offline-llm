@@ -9,6 +9,7 @@ from downloads import download_manager
 from models import init_db
 from routes.chat import router as chat_router
 from routes.models import router as models_router
+from routes.system import router as system_router
 from runtime import runtime_manager
 
 logging.basicConfig(
@@ -45,6 +46,7 @@ app.add_middleware(
 # Register routers
 app.include_router(chat_router)
 app.include_router(models_router)
+app.include_router(system_router)
 
 
 @app.get("/")

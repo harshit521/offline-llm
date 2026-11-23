@@ -36,6 +36,48 @@ export interface ChatApiResponse {
     completion_tokens?: number
     total_tokens?: number
   }
+  conversation_id?: string
+  conversation_title?: string
+}
+
+/** A message as stored by the backend. */
+export interface PersistedMessage {
+  id: string
+  conversation_id: string
+  role: 'user' | 'assistant' | 'system'
+  content: string
+  tokens: number
+  created_at: string | null
+}
+
+/** Conversation row returned by the list endpoint. */
+export interface ConversationSummary {
+  id: string
+  title: string
+  model: string | null
+  created_at: string | null
+  updated_at: string | null
+  message_count: number
+  preview: string
+}
+
+/** Conversation row including its ordered messages. */
+export interface ConversationDetail extends ConversationSummary {
+  messages: PersistedMessage[]
+}
+
+/** One maintenance capability reported by the backend. */
+export interface Capability {
+  supported: boolean
+  endpoint: string | null
+  reason: string | null
+}
+
+/** Maintenance capabilities exposed by GET /api/system/capabilities. */
+export interface SystemCapabilities {
+  clear_history: Capability
+  clear_documents: Capability
+  clear_cache: Capability
 }
 
 /** A GGUF file recorded in the backend model registry. */

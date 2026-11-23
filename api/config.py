@@ -89,6 +89,10 @@ MAX_MODEL_CONTEXT = _int("MAX_MODEL_CONTEXT", 131072)
 MODEL_GPU_LAYERS = _optional_int("MODEL_GPU_LAYERS")
 MODEL_THREADS = _optional_int("MODEL_THREADS")
 
+# Upper bound for a single chat completion. Must match the frontend settings
+# range (web/src/store/settingsStore.ts) so the UI never offers an invalid value.
+MAX_CHAT_TOKENS = _int("MAX_CHAT_TOKENS", 8192)
+
 # Reasoning models (e.g. Qwen3.5) can spend the whole token budget "thinking"
 # before emitting an answer. Default to off for a predictable chat UI; set to
 # "on" or "auto" to keep the model's native behaviour.

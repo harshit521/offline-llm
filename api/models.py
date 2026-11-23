@@ -7,6 +7,7 @@ idempotent and only creates missing tables, so existing databases keep working.
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -35,10 +36,14 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _uuid() -> str:
+    return str(uuid.uuid4())
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
 
-    id = Column(String, primary_key=True, default=lambda: f"conv-{_utcnow().timestamp()}")
+    id = Column(String, primary_key=True, default=_uuid)
     title = Column(String, nullable=False, default="New Conversation")
     model = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
@@ -54,9 +59,12 @@ class Conversation(Base):
 class Message(Base):
     __tablename__ = "messages"
 
-    id = Column(String, primary_key=True, default=lambda: f"msg-{_utcnow().timestamp()}")
+    id = Column(String, primary_key=True, default=_uuid)
     conversation_id = Column(
-        String, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
+        String,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     role = Column(String, nullable=False)  # 'user' or 'assistant'
     content = Column(Text, nullable=False)

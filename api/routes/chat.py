@@ -1,10 +1,29 @@
 import json
-import uuid
-from fastapi import APIRouter, HTTPException, Path
-from pydantic import BaseModel, Field
-import httpx
+from typing import Literal
 
-from llama_client import chat, stream_chat, get_base_url
+import httpx
+from fastapi import APIRouter, HTTPException, Path
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
+
+import config
+from chat_service import stream_and_persist
+from conversations import (
+    DEFAULT_TITLE,
+    ConversationNotFound,
+    add_message,
+    create_conversation,
+    derive_preview,
+    derive_title,
+    get_conversation,
+    list_conversation_messages,
+    prepare_turn,
+    save_assistant_message,
+    serialize_conversation,
+    serialize_message,
+)
+from llama_client import chat, get_base_url
 from models import Conversation, Message, get_db
 from runtime import runtime_manager
 
@@ -14,8 +33,28 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 class ChatRequest(BaseModel):
     messages: list[dict] = Field(min_length=1)
     temperature: float = Field(default=0.2, ge=0, le=2)
-    max_tokens: int = Field(default=512, ge=1, le=2048)
+    max_tokens: int = Field(default=512, ge=1, le=config.MAX_CHAT_TOKENS)
+    top_p: float = Field(default=0.9, ge=0, le=1)
     model_id: str | None = Field(default=None, max_length=200)
+    conversation_id: str | None = Field(default=None, max_length=200)
+    # Regenerate keeps the existing user message and replaces the last answer.
+    persist_user_message: bool = True
+    replace_last_assistant: bool = False
+
+
+class ConversationCreateRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=200)
+    model: str | None = Field(default=None, max_length=200)
+
+
+class ConversationUpdateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+
+class MessageCreateRequest(BaseModel):
+    role: Literal["user", "assistant", "system"] = "user"
+    content: str = Field(min_length=1)
+    tokens: int | None = Field(default=None, ge=0)
 
 
 def _ensure_model_ready(model_id: str | None) -> None:
@@ -44,15 +83,41 @@ def _ensure_model_ready(model_id: str | None) -> None:
         )
 
 
+def _open_turn(request: ChatRequest) -> tuple[str, str]:
+    """Create/resolve the conversation and persist the user message."""
+    db = get_db()
+    try:
+        conversation = prepare_turn(
+            db,
+            conversation_id=request.conversation_id,
+            messages=request.messages,
+            model=request.model_id,
+            persist_user_message=request.persist_user_message,
+            replace_last_assistant=request.replace_last_assistant,
+        )
+        return conversation.id, conversation.title
+    except ConversationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail="Could not save the conversation."
+        ) from exc
+    finally:
+        db.close()
+
 
 @router.post("")
 async def create_chat(request: ChatRequest):
     _ensure_model_ready(request.model_id)
+    conversation_id, title = _open_turn(request)
+
     try:
-        return await chat(
+        result = await chat(
             messages=request.messages,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
+            top_p=request.top_p,
         )
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
@@ -65,34 +130,37 @@ async def create_chat(request: ChatRequest):
             detail=f"Unable to generate a response: {exc}",
         ) from exc
 
+    usage = result.get("usage") or {}
+    save_assistant_message(
+        conversation_id,
+        result.get("content") or "",
+        tokens=usage.get("completion_tokens"),
+    )
+
+    result["conversation_id"] = conversation_id
+    result["conversation_title"] = title
+    return result
+
 
 @router.post("/stream")
 async def create_chat_stream(request: ChatRequest):
     """Streaming chat endpoint that returns SSE events."""
     _ensure_model_ready(request.model_id)
+    conversation_id, _ = _open_turn(request)
 
-    async def event_generator():
-        async for chunk in stream_chat(
+    return StreamingResponse(
+        stream_and_persist(
             messages=request.messages,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
-        ):
-            if chunk.get("done"):
-                yield f"data: [DONE]\n\n"
-                break
-            elif chunk.get("error"):
-                yield f"data: {json.dumps({'error': chunk['error']})}\n\n"
-            elif chunk.get("content") is not None:
-                yield f"data: {json.dumps({'content': chunk['content']})}\n\n"
-
-    from fastapi.responses import StreamingResponse
-
-    return StreamingResponse(
-        event_generator(),
+            top_p=request.top_p,
+            conversation_id=conversation_id,
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
+            "X-Conversation-Id": conversation_id,
         },
     )
 
@@ -103,9 +171,7 @@ async def health():
     base_url = get_base_url()
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            llama_health = await client.get(
-                f"{base_url}/health"
-            )
+            llama_health = await client.get(f"{base_url}/health")
             llama_ok = llama_health.status_code == 200
     except Exception:
         llama_ok = False
@@ -126,24 +192,23 @@ async def list_models():
     Kept for backwards compatibility. The Phase 3 registry lives at
     ``GET /api/models``.
     """
-    async with httpx.AsyncClient(timeout=httpx.Timeout(
-        connect=5.0,
-        read=10.0,
-        write=5.0,
-        pool=5.0,
-    )) as client:
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(
+            connect=5.0,
+            read=10.0,
+            write=5.0,
+            pool=5.0,
+        )
+    ) as client:
         try:
-            response = await client.get(
-                f"{get_base_url()}/v1/models"
-            )
+            response = await client.get(f"{get_base_url()}/v1/models")
             if response.status_code == 200:
                 data = response.json()
                 return {"data": data.get("data", [])}
-            else:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"llama.cpp returned HTTP {response.status_code}",
-                )
+            raise HTTPException(
+                status_code=502,
+                detail=f"llama.cpp returned HTTP {response.status_code}",
+            )
         except httpx.HTTPError as exc:
             raise HTTPException(
                 status_code=503,
@@ -153,87 +218,83 @@ async def list_models():
 
 # --- Conversation API endpoints ---
 
-CONVERSATION_ID_LENGTH = 50  # prefix length for generating titles
 
-
-@router.get("/conversations", response_model=list)
+@router.get("/conversations")
 async def list_conversations():
-    """List all conversations."""
+    """List conversations with a message count and last-message preview."""
     db = get_db()
     try:
-        conversations = db.query(Conversation).order_by(
-            Conversation.updated_at.desc()
-        ).all()
-        return [
-            {
-                "id": c.id,
-                "title": c.title,
-                "model": c.model,
-                "created_at": c.created_at.isoformat() if c.created_at else None,
-                "updated_at": c.updated_at.isoformat() if c.updated_at else None,
-            }
-            for c in conversations
-        ]
-    finally:
-        db.close()
-
-
-@router.post("/conversations", response_model=dict)
-async def create_conversation(title: str = "New Conversation"):
-    """Create a new conversation."""
-    db = get_db()
-    try:
-        conv = Conversation(id="", title=title, model=None)
-        # Generate a proper ID
-        import uuid
-        conv.id = str(uuid.uuid4())
-        db.add(conv)
-        db.commit()
-        db.refresh(conv)
-        return {
-            "id": conv.id,
-            "title": conv.title,
-            "model": conv.model,
-            "created_at": conv.created_at.isoformat() if conv.created_at else None,
-            "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
-        }
-    finally:
-        db.close()
-
-
-@router.get("/conversations/{conversation_id}", response_model=dict)
-async def get_conversation(
-    conversation_id: str = Path(...),
-):
-    """Get a specific conversation by ID."""
-    db = get_db()
-    try:
-        conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
-        if not conv:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        messages = (
-            db.query(Message)
-            .filter(Message.conversation_id == conversation_id)
-            .order_by(Message.created_at.asc())
+        conversations = (
+            db.query(Conversation)
+            .order_by(Conversation.updated_at.desc())
             .all()
         )
-        return {
-            "id": conv.id,
-            "title": conv.title,
-            "model": conv.model,
-            "created_at": conv.created_at.isoformat() if conv.created_at else None,
-            "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
-            "messages": [
-                {
-                    "id": m.id,
-                    "role": m.role,
-                    "content": m.content,
-                    "tokens": m.tokens,
-                    "created_at": m.created_at.isoformat() if m.created_at else None,
-                }
-                for m in messages
-            ],
-        }
+
+        messages_by_conversation: dict[str, list[Message]] = {}
+        if conversations:
+            ids = [conversation.id for conversation in conversations]
+            rows = (
+                db.query(Message)
+                .filter(Message.conversation_id.in_(ids))
+                .order_by(Message.created_at.asc(), Message.id.asc())
+                .all()
+            )
+            for message in rows:
+                messages_by_conversation.setdefault(
+                    message.conversation_id, []
+                ).append(message)
+
+        result = []
+        for conversation in conversations:
+            messages = messages_by_conversation.get(conversation.id, [])
+            result.append(
+                serialize_conversation(
+                    conversation,
+                    message_count=len(messages),
+                    preview=derive_preview(messages[-1].content) if messages else "",
+                )
+            )
+        return result
+    finally:
+        db.close()
+
+
+@router.post("/conversations", status_code=201)
+async def create_conversation_endpoint(request: ConversationCreateRequest):
+    """Create a conversation. Title is optional and can be set later."""
+    db = get_db()
+    try:
+        conversation = create_conversation(
+            db,
+            title=request.title,
+            model=request.model,
+        )
+        return serialize_conversation(conversation)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail="Could not create the conversation."
+        ) from exc
+    finally:
+        db.close()
+
+
+@router.get("/conversations/{conversation_id}")
+async def get_conversation_endpoint(conversation_id: str = Path(...)):
+    """Return one conversation together with its ordered messages."""
+    db = get_db()
+    try:
+        conversation = get_conversation(db, conversation_id)
+        messages = list_conversation_messages(db, conversation_id)
+        return serialize_conversation(
+            conversation,
+            messages=messages,
+            message_count=len(messages),
+            preview=derive_preview(messages[-1].content) if messages else "",
+            include_messages=True,
+        )
+    except ConversationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     finally:
         db.close()
 
@@ -241,75 +302,119 @@ async def get_conversation(
 @router.patch("/conversations/{conversation_id}")
 async def update_conversation(
     conversation_id: str = Path(...),
-    title: str = None,
+    request: ConversationUpdateRequest = ...,
 ):
-    """Update a conversation title."""
+    """Rename a conversation."""
+    title = " ".join(request.title.split())
+    if not title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty.")
+
     db = get_db()
     try:
-        conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
-        if not conv:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        if title is not None:
-            conv.title = title
+        conversation = get_conversation(db, conversation_id)
+        conversation.title = title
         db.commit()
-        db.refresh(conv)
-        return {
-            "id": conv.id,
-            "title": conv.title,
-            "model": conv.model,
-            "created_at": conv.created_at.isoformat() if conv.created_at else None,
-            "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
-        }
+        db.refresh(conversation)
+        return serialize_conversation(conversation)
+    except ConversationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail="Could not rename the conversation."
+        ) from exc
+    finally:
+        db.close()
+
+
+@router.delete("/conversations")
+async def delete_all_conversations():
+    """Delete every conversation and message (Settings → Clear chat history)."""
+    db = get_db()
+    try:
+        deleted = db.query(Conversation).count()
+        # Delete messages first because SQLite foreign keys are not enforced.
+        db.query(Message).delete(synchronize_session=False)
+        db.query(Conversation).delete(synchronize_session=False)
+        db.commit()
+        return {"success": True, "deleted": deleted}
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail="Could not clear the conversation history."
+        ) from exc
     finally:
         db.close()
 
 
 @router.delete("/conversations/{conversation_id}")
-async def delete_conversation(
-    conversation_id: str = Path(...),
-):
-    """Delete a conversation and all its messages."""
+async def delete_conversation(conversation_id: str = Path(...)):
+    """Delete a conversation and all of its messages."""
     db = get_db()
     try:
-        conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
-        if not conv:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        db.delete(conv)
+        conversation = get_conversation(db, conversation_id)
+        db.delete(conversation)
         db.commit()
         return {"success": True, "deleted_id": conversation_id}
+    except ConversationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail="Could not delete the conversation."
+        ) from exc
     finally:
         db.close()
 
 
-@router.get("/conversations/{conversation_id}/messages", response_model=dict)
-async def get_conversation_messages(
+@router.post("/conversations/{conversation_id}/messages", status_code=201)
+async def add_conversation_message(
     conversation_id: str = Path(...),
+    request: MessageCreateRequest = ...,
 ):
+    """Append a message to a conversation using a JSON body."""
+    db = get_db()
+    try:
+        conversation = get_conversation(db, conversation_id)
+
+        if (
+            request.role == "user"
+            and conversation.title in {DEFAULT_TITLE, ""}
+        ):
+            conversation.title = derive_title(request.content)
+
+        message = add_message(
+            db,
+            conversation,
+            role=request.role,
+            content=request.content,
+            tokens=request.tokens,
+        )
+        return serialize_message(message)
+    except ConversationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail="Could not add the message."
+        ) from exc
+    finally:
+        db.close()
+
+
+@router.get("/conversations/{conversation_id}/messages")
+async def get_conversation_messages(conversation_id: str = Path(...)):
     """Get all messages for a conversation."""
     db = get_db()
     try:
-        conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
-        if not conv:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        messages = (
-            db.query(Message)
-            .filter(Message.conversation_id == conversation_id)
-            .order_by(Message.created_at.asc())
-            .all()
-        )
+        conversation = get_conversation(db, conversation_id)
+        messages = list_conversation_messages(db, conversation_id)
         return {
-            "conversation_id": conv.id,
-            "conversation_title": conv.title,
-            "messages": [
-                {
-                    "id": m.id,
-                    "role": m.role,
-                    "content": m.content,
-                    "tokens": m.tokens,
-                    "created_at": m.created_at.isoformat() if m.created_at else None,
-                }
-                for m in messages
-            ],
+            "conversation_id": conversation.id,
+            "conversation_title": conversation.title,
+            "messages": [serialize_message(message) for message in messages],
         }
+    except ConversationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     finally:
         db.close()

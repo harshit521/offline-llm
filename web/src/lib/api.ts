@@ -1,9 +1,13 @@
 import type {
   ChatMessage,
   ChatApiResponse,
+  ConversationDetail,
+  ConversationSummary,
   DownloadProgress,
+  PersistedMessage,
   RegisteredModel,
   RuntimeStatus,
+  SystemCapabilities,
 } from '@/types'
 
 // Backend API URL from environment variables with development fallback.
@@ -117,7 +121,11 @@ async function* readSseData(response: Response): AsyncGenerator<string> {
 export interface ChatOptions {
   temperature?: number
   max_tokens?: number
+  top_p?: number
   model_id?: string
+  conversation_id?: string
+  persist_user_message?: boolean
+  replace_last_assistant?: boolean
 }
 
 /**
@@ -135,7 +143,11 @@ export async function sendChat(
       messages: messages.map(toBackendMessage),
       temperature: options.temperature ?? 0.2,
       max_tokens: options.max_tokens ?? 512,
+      top_p: options.top_p ?? 0.9,
       model_id: options.model_id,
+      conversation_id: options.conversation_id,
+      persist_user_message: options.persist_user_message,
+      replace_last_assistant: options.replace_last_assistant,
     }),
     signal,
   })
@@ -156,7 +168,11 @@ export async function* sendChatStream(
       messages: messages.map(toBackendMessage),
       temperature: options.temperature ?? 0.2,
       max_tokens: options.max_tokens ?? 512,
+      top_p: options.top_p ?? 0.9,
       model_id: options.model_id,
+      conversation_id: options.conversation_id,
+      persist_user_message: options.persist_user_message,
+      replace_last_assistant: options.replace_last_assistant,
     }),
     signal,
   })
@@ -285,4 +301,90 @@ export async function unloadModel(id: string): Promise<RuntimeStatus> {
 /** Current managed runtime state plus external-server reachability. */
 export async function getRuntimeStatus(): Promise<RuntimeStatus> {
   return requestJson<RuntimeStatus>('/api/models/runtime')
+}
+
+/* --------------------------------------------------------------------------
+ * Conversations
+ * ------------------------------------------------------------------------ */
+
+/** List saved conversations, newest activity first. */
+export async function listConversations(): Promise<ConversationSummary[]> {
+  return requestJson<ConversationSummary[]>('/api/chat/conversations')
+}
+
+/** Create an empty conversation. */
+export async function createConversation(
+  payload: { title?: string; model?: string } = {},
+): Promise<ConversationSummary> {
+  return requestJson<ConversationSummary>('/api/chat/conversations', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+/** Load one conversation together with its ordered messages. */
+export async function getConversation(
+  id: string,
+): Promise<ConversationDetail> {
+  return requestJson<ConversationDetail>(
+    `/api/chat/conversations/${encodeURIComponent(id)}`,
+  )
+}
+
+/** Rename a conversation. */
+export async function renameConversation(
+  id: string,
+  title: string,
+): Promise<ConversationSummary> {
+  return requestJson<ConversationSummary>(
+    `/api/chat/conversations/${encodeURIComponent(id)}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    },
+  )
+}
+
+/** Delete a conversation and all of its messages. */
+export async function deleteConversation(
+  id: string,
+): Promise<{ success: boolean; deleted_id: string }> {
+  return requestJson(
+    `/api/chat/conversations/${encodeURIComponent(id)}`,
+    { method: 'DELETE' },
+  )
+}
+
+/** Delete every conversation and message. */
+export async function clearAllConversations(): Promise<{
+  success: boolean
+  deleted: number
+}> {
+  return requestJson('/api/chat/conversations', { method: 'DELETE' })
+}
+
+/** Maintenance actions the backend can safely perform. */
+export async function getCapabilities(): Promise<SystemCapabilities> {
+  return requestJson<SystemCapabilities>('/api/system/capabilities')
+}
+
+/** Append a message to a conversation. */
+export async function addConversationMessage(
+  id: string,
+  payload: {
+    role: 'user' | 'assistant' | 'system'
+    content: string
+    tokens?: number
+  },
+): Promise<PersistedMessage> {
+  return requestJson<PersistedMessage>(
+    `/api/chat/conversations/${encodeURIComponent(id)}/messages`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+  )
 }
