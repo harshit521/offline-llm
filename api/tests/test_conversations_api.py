@@ -251,7 +251,7 @@ class ConversationApiTests(unittest.TestCase):
 
         db = get_db()
         try:
-            conversation = prepare_turn(
+            conversation, _ = prepare_turn(
                 db,
                 conversation_id=None,
                 messages=[{"role": "user", "content": "Tell me a story"}],
@@ -351,40 +351,126 @@ class ConversationApiTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_regenerate_replaces_last_assistant_message(self) -> None:
+    def _seed_two_turns(self) -> str:
         conversation = _create_conversation(self.client, title="Regenerate")
         conversation_id = conversation["id"]
+        for role, content in (
+            ("user", "Question one"),
+            ("assistant", "Answer one"),
+            ("user", "Question two"),
+            ("assistant", "Answer two"),
+        ):
+            response = self.client.post(
+                f"/api/chat/conversations/{conversation_id}/messages",
+                json={"role": role, "content": content},
+            )
+            self.assertEqual(response.status_code, 201, response.text)
+        return conversation_id
 
-        self.client.post(
-            f"/api/chat/conversations/{conversation_id}/messages",
-            json={"role": "user", "content": "Question"},
-        )
-        self.client.post(
-            f"/api/chat/conversations/{conversation_id}/messages",
-            json={"role": "assistant", "content": "Old answer"},
-        )
+    def test_regenerate_replaces_targeted_older_assistant_turn(self) -> None:
+        conversation_id = self._seed_two_turns()
 
         async def fake_stream(**_kwargs):
-            yield {"content": "New answer"}
+            yield {"content": "Answer one rewritten"}
             yield {"done": True}
 
         with patch("chat_service.stream_chat", new=fake_stream):
-            self.client.post(
+            response = self.client.post(
                 "/api/chat/stream",
                 json={
-                    "messages": [{"role": "user", "content": "Question"}],
+                    "messages": [
+                        {"role": "user", "content": "Question one"},
+                    ],
                     "conversation_id": conversation_id,
                     "persist_user_message": False,
-                    "replace_last_assistant": True,
+                    "replace_assistant_index": 0,
                 },
             )
+
+        self.assertEqual(response.status_code, 200, response.text)
+
+        detail = self.client.get(
+            f"/api/chat/conversations/{conversation_id}"
+        ).json()
+        self.assertEqual(
+            [message["role"] for message in detail["messages"]],
+            ["user", "assistant", "user", "assistant"],
+        )
+        self.assertEqual(
+            [message["content"] for message in detail["messages"]],
+            [
+                "Question one",
+                "Answer one rewritten",
+                "Question two",
+                "Answer two",
+            ],
+        )
+
+    def test_non_streaming_regenerate_replaces_targeted_turn(self) -> None:
+        conversation_id = self._seed_two_turns()
+        fake_chat = AsyncMock(
+            return_value={
+                "content": "Answer two rewritten",
+                "usage": {"completion_tokens": 4},
+                "model": "test-model",
+            }
+        )
+
+        with patch("routes.chat.chat", new=fake_chat):
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "messages": [
+                        {"role": "user", "content": "Question one"},
+                        {"role": "assistant", "content": "Answer one"},
+                        {"role": "user", "content": "Question two"},
+                    ],
+                    "conversation_id": conversation_id,
+                    "persist_user_message": False,
+                    "replace_assistant_index": 1,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
 
         detail = self.client.get(
             f"/api/chat/conversations/{conversation_id}"
         ).json()
         self.assertEqual(
             [message["content"] for message in detail["messages"]],
-            ["Question", "New answer"],
+            [
+                "Question one",
+                "Answer one",
+                "Question two",
+                "Answer two rewritten",
+            ],
+        )
+
+    def test_regenerate_out_of_range_index_returns_404(self) -> None:
+        conversation_id = self._seed_two_turns()
+
+        response = self.client.post(
+            "/api/chat/stream",
+            json={
+                "messages": [{"role": "user", "content": "Question one"}],
+                "conversation_id": conversation_id,
+                "persist_user_message": False,
+                "replace_assistant_index": 9,
+            },
+        )
+        self.assertEqual(response.status_code, 404, response.text)
+
+        detail = self.client.get(
+            f"/api/chat/conversations/{conversation_id}"
+        ).json()
+        self.assertEqual(
+            [message["content"] for message in detail["messages"]],
+            [
+                "Question one",
+                "Answer one",
+                "Question two",
+                "Answer two",
+            ],
         )
 
 

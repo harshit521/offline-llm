@@ -125,7 +125,8 @@ export interface ChatOptions {
   model_id?: string
   conversation_id?: string
   persist_user_message?: boolean
-  replace_last_assistant?: boolean
+  /** 0-based ordinal among assistant messages, used to regenerate one turn. */
+  replace_assistant_index?: number
 }
 
 /**
@@ -147,7 +148,7 @@ export async function sendChat(
       model_id: options.model_id,
       conversation_id: options.conversation_id,
       persist_user_message: options.persist_user_message,
-      replace_last_assistant: options.replace_last_assistant,
+      replace_assistant_index: options.replace_assistant_index,
     }),
     signal,
   })
@@ -172,7 +173,7 @@ export async function* sendChatStream(
       model_id: options.model_id,
       conversation_id: options.conversation_id,
       persist_user_message: options.persist_user_message,
-      replace_last_assistant: options.replace_last_assistant,
+      replace_assistant_index: options.replace_assistant_index,
     }),
     signal,
   })

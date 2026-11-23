@@ -5,10 +5,10 @@ PYTHON ?= python3
 API_DIR := api
 WEB_DIR := web
 
-.PHONY: dev backend frontend test help
+.PHONY: dev backend frontend test test-backend test-frontend typecheck lint build help
 
 help: ## Show available targets
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
 
 dev: ## Start backend and frontend together
 	@echo ">>> Starting Offline LLM development environment"
@@ -23,5 +23,19 @@ backend: ## Run the FastAPI backend with reload
 frontend: ## Run the Vite dev server
 	cd $(WEB_DIR) && npm run dev
 
-test: ## Run backend unit tests
+test: test-backend test-frontend ## Run the complete test suite (backend + frontend)
+
+test-backend: ## Run backend unit tests
 	$(PYTHON) -m unittest discover -s api/tests -v
+
+test-frontend: ## Run frontend unit tests
+	cd $(WEB_DIR) && npm test
+
+typecheck: ## Type-check the frontend
+	cd $(WEB_DIR) && npx tsc --noEmit
+
+lint: ## Lint the frontend
+	cd $(WEB_DIR) && npm run lint
+
+build: ## Type-check and build the frontend for production
+	cd $(WEB_DIR) && npm run build

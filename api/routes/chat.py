@@ -11,6 +11,7 @@ import config
 from chat_service import stream_and_persist
 from conversations import (
     DEFAULT_TITLE,
+    AssistantMessageNotFound,
     ConversationNotFound,
     add_message,
     create_conversation,
@@ -37,9 +38,10 @@ class ChatRequest(BaseModel):
     top_p: float = Field(default=0.9, ge=0, le=1)
     model_id: str | None = Field(default=None, max_length=200)
     conversation_id: str | None = Field(default=None, max_length=200)
-    # Regenerate keeps the existing user message and replaces the last answer.
+    # Regenerate keeps the existing user message and replaces the clicked
+    # assistant answer, identified by its 0-based ordinal among assistant turns.
     persist_user_message: bool = True
-    replace_last_assistant: bool = False
+    replace_assistant_index: int | None = Field(default=None, ge=0)
 
 
 class ConversationCreateRequest(BaseModel):
@@ -83,20 +85,24 @@ def _ensure_model_ready(model_id: str | None) -> None:
         )
 
 
-def _open_turn(request: ChatRequest) -> tuple[str, str]:
-    """Create/resolve the conversation and persist the user message."""
+def _open_turn(request: ChatRequest) -> tuple[str, str, str | None]:
+    """Create/resolve the conversation and persist the user message.
+
+    Returns ``(conversation_id, title, replace_message_id)``. The last value is
+    only set for regeneration and identifies the exact assistant turn to update.
+    """
     db = get_db()
     try:
-        conversation = prepare_turn(
+        conversation, replace_message_id = prepare_turn(
             db,
             conversation_id=request.conversation_id,
             messages=request.messages,
             model=request.model_id,
             persist_user_message=request.persist_user_message,
-            replace_last_assistant=request.replace_last_assistant,
+            replace_assistant_index=request.replace_assistant_index,
         )
-        return conversation.id, conversation.title
-    except ConversationNotFound as exc:
+        return conversation.id, conversation.title, replace_message_id
+    except (ConversationNotFound, AssistantMessageNotFound) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except SQLAlchemyError as exc:
         db.rollback()
@@ -110,7 +116,7 @@ def _open_turn(request: ChatRequest) -> tuple[str, str]:
 @router.post("")
 async def create_chat(request: ChatRequest):
     _ensure_model_ready(request.model_id)
-    conversation_id, title = _open_turn(request)
+    conversation_id, title, replace_message_id = _open_turn(request)
 
     try:
         result = await chat(
@@ -135,6 +141,7 @@ async def create_chat(request: ChatRequest):
         conversation_id,
         result.get("content") or "",
         tokens=usage.get("completion_tokens"),
+        replace_message_id=replace_message_id,
     )
 
     result["conversation_id"] = conversation_id
@@ -146,7 +153,7 @@ async def create_chat(request: ChatRequest):
 async def create_chat_stream(request: ChatRequest):
     """Streaming chat endpoint that returns SSE events."""
     _ensure_model_ready(request.model_id)
-    conversation_id, _ = _open_turn(request)
+    conversation_id, _, replace_message_id = _open_turn(request)
 
     return StreamingResponse(
         stream_and_persist(
@@ -155,6 +162,7 @@ async def create_chat_stream(request: ChatRequest):
             max_tokens=request.max_tokens,
             top_p=request.top_p,
             conversation_id=conversation_id,
+            replace_message_id=replace_message_id,
         ),
         media_type="text/event-stream",
         headers={

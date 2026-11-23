@@ -28,6 +28,10 @@ class ConversationNotFound(Exception):
     """The requested conversation id does not exist."""
 
 
+class AssistantMessageNotFound(Exception):
+    """The assistant turn requested for regeneration does not exist."""
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -158,22 +162,29 @@ def add_message(
     return message
 
 
-def delete_last_assistant_message(db: Session, conversation: Conversation) -> bool:
-    """Remove the most recent assistant message (used by regenerate)."""
-    message = (
+def resolve_assistant_message(
+    db: Session,
+    conversation: Conversation,
+    assistant_index: int,
+) -> Message:
+    """Return the assistant message at ``assistant_index`` (0-based, oldest first).
+
+    Regeneration targets a specific visible turn, not whichever assistant
+    message happens to be newest, so the client sends the ordinal of the clicked
+    answer among the conversation's assistant messages.
+    """
+    assistants = (
         db.query(Message)
         .filter(
             Message.conversation_id == conversation.id,
             Message.role == "assistant",
         )
-        .order_by(Message.created_at.desc(), Message.id.desc())
-        .first()
+        .order_by(Message.created_at.asc(), Message.id.asc())
+        .all()
     )
-    if message is None:
-        return False
-    db.delete(message)
-    conversation.updated_at = _now()
-    return True
+    if assistant_index < 0 or assistant_index >= len(assistants):
+        raise AssistantMessageNotFound("Assistant message not found.")
+    return assistants[assistant_index]
 
 
 def prepare_turn(
@@ -183,13 +194,17 @@ def prepare_turn(
     messages: list[dict],
     model: str | None,
     persist_user_message: bool = True,
-    replace_last_assistant: bool = False,
-) -> Conversation:
+    replace_assistant_index: int | None = None,
+) -> tuple[Conversation, str | None]:
     """Create/resolve a conversation and persist the incoming user turn.
 
     Only the final message in ``messages`` is written, because clients send the
     whole history on every request. Callers should pass
     ``persist_user_message=False`` when regenerating a response.
+
+    When ``replace_assistant_index`` is set the matching assistant message is
+    resolved and its id is returned so the generated text can be written back in
+    place, preserving the surrounding history and its order.
     """
     if conversation_id:
         conversation = get_conversation(db, conversation_id)
@@ -198,13 +213,16 @@ def prepare_turn(
     else:
         conversation = create_conversation(db, model=model)
 
+    target_message_id: str | None = None
+    if replace_assistant_index is not None:
+        target_message_id = resolve_assistant_message(
+            db, conversation, replace_assistant_index
+        ).id
+
     last = messages[-1] if messages else None
     user_text = ""
     if last and last.get("role") == "user":
         user_text = str(last.get("content") or "")
-
-    if replace_last_assistant:
-        delete_last_assistant_message(db, conversation)
 
     if persist_user_message and user_text:
         if conversation.title in {DEFAULT_TITLE, ""}:
@@ -220,7 +238,7 @@ def prepare_turn(
     conversation.updated_at = _now()
     db.commit()
     db.refresh(conversation)
-    return conversation
+    return conversation, target_message_id
 
 
 def save_assistant_message(
@@ -228,8 +246,13 @@ def save_assistant_message(
     content: str,
     *,
     tokens: int | None = None,
+    replace_message_id: str | None = None,
 ) -> dict | None:
-    """Persist an assistant response in its own short-lived session."""
+    """Persist an assistant response in its own short-lived session.
+
+    ``replace_message_id`` updates an existing assistant turn in place, which
+    keeps the conversation order intact when regenerating an older answer.
+    """
     if not content:
         return None
 
@@ -246,6 +269,28 @@ def save_assistant_message(
                 conversation_id,
             )
             return None
+
+        if replace_message_id:
+            message = (
+                db.query(Message)
+                .filter(
+                    Message.id == replace_message_id,
+                    Message.conversation_id == conversation_id,
+                )
+                .first()
+            )
+            if message is None:
+                logger.warning(
+                    "Cannot regenerate missing assistant message %s",
+                    replace_message_id,
+                )
+                return None
+            message.content = content
+            message.tokens = tokens or 0
+            conversation.updated_at = _now()
+            db.commit()
+            db.refresh(message)
+            return serialize_message(message)
 
         message = add_message(
             db,

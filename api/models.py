@@ -3,6 +3,10 @@
 Phase 2 introduced conversations/messages. Phase 3 adds the persistent model
 registry. ``Base.metadata.create_all`` is used for schema initialization; it is
 idempotent and only creates missing tables, so existing databases keep working.
+
+``create_all`` does not add indexes to tables that already exist, which means a
+database created before an index was declared would never receive it. The
+``ensure_indexes`` migration below closes that gap at every startup.
 """
 
 from __future__ import annotations
@@ -92,9 +96,23 @@ class ModelRecord(Base):
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
 
+def ensure_indexes() -> None:
+    """Create indexes that are missing from pre-existing tables.
+
+    This is the migration path for databases created before an index was
+    declared (for example ``messages.conversation_id``). ``checkfirst`` makes it
+    safe to run on every startup and against freshly created databases.
+    """
+    with engine.begin() as connection:
+        for table in Base.metadata.sorted_tables:
+            for index in table.indexes:
+                index.create(bind=connection, checkfirst=True)
+
+
 def init_db() -> None:
-    """Create any missing tables."""
+    """Create any missing tables and indexes."""
     Base.metadata.create_all(bind=engine)
+    ensure_indexes()
 
 
 def get_db():

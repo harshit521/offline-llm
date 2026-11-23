@@ -24,6 +24,7 @@ async def stream_and_persist(
     max_tokens: int,
     top_p: float,
     conversation_id: str,
+    replace_message_id: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """Yield SSE events and persist whatever assistant text was generated.
 
@@ -55,4 +56,8 @@ async def stream_and_persist(
     finally:
         text = "".join(chunks)
         if text:
-            save_assistant_message(conversation_id, text)
+            save_assistant_message(
+                conversation_id,
+                text,
+                replace_message_id=replace_message_id,
+            )

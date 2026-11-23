@@ -220,6 +220,8 @@ export function ChatWorkspace() {
     promptOverride?: string,
     historyOverride?: ChatMessage[],
     mode: 'normal' | 'regenerate' = 'normal',
+    targetAssistantIndex?: number,
+    replaceAssistantIndex?: number,
   ) => {
     const prompt = (promptOverride ?? input).trim()
 
@@ -227,6 +229,11 @@ export function ChatWorkspace() {
 
     if (mode === 'regenerate' && !conversationId) {
       setError('Cannot regenerate without a saved conversation.')
+      return
+    }
+
+    if (mode === 'regenerate' && targetAssistantIndex === undefined) {
+      setError('Cannot regenerate without a target assistant turn.')
       return
     }
 
@@ -242,12 +249,32 @@ export function ChatWorkspace() {
     }
 
     const conversationHistory = historyOverride ?? messages
+    // For a new turn the answer is appended. For regeneration the answer is
+    // written back into the clicked slot so later turns keep their position.
     const nextMessages = [...conversationHistory, userMessage]
+    const assistantSlot =
+      mode === 'regenerate' && targetAssistantIndex !== undefined
+        ? targetAssistantIndex
+        : nextMessages.length
+    const previousAssistantText =
+      mode === 'regenerate' && targetAssistantIndex !== undefined
+        ? (messages[targetAssistantIndex]?.text ?? '')
+        : ''
 
-    setMessages([
-      ...nextMessages,
-      { role: 'ASSISTANT', text: '', time: now },
-    ])
+    if (mode === 'regenerate') {
+      setMessages((current) => {
+        const updated = [...current]
+        if (updated[assistantSlot]?.role === 'ASSISTANT') {
+          updated[assistantSlot] = { ...updated[assistantSlot], text: '' }
+        }
+        return updated
+      })
+    } else {
+      setMessages([
+        ...nextMessages,
+        { role: 'ASSISTANT', text: '', time: now },
+      ])
+    }
 
     setInput('')
     setGenerating(true)
@@ -281,7 +308,8 @@ export function ChatWorkspace() {
         model_id: settings.defaultModelId,
         conversation_id: activeConversationId,
         persist_user_message: mode !== 'regenerate',
-        replace_last_assistant: mode === 'regenerate',
+        replace_assistant_index:
+          mode === 'regenerate' ? replaceAssistantIndex : undefined,
       }
 
       if (settings.streaming) {
@@ -296,11 +324,11 @@ export function ChatWorkspace() {
 
           setMessages((current) => {
             const updated = [...current]
-            const last = updated.length - 1
+            const target = updated[assistantSlot]
 
-            if (last >= 0 && updated[last].role === 'ASSISTANT') {
-              updated[last] = {
-                ...updated[last],
+            if (target?.role === 'ASSISTANT') {
+              updated[assistantSlot] = {
+                ...target,
                 text: contentChunks.join(''),
               }
             }
@@ -317,11 +345,11 @@ export function ChatWorkspace() {
 
         setMessages((current) => {
           const updated = [...current]
-          const last = updated.length - 1
+          const target = updated[assistantSlot]
 
-          if (last >= 0 && updated[last].role === 'ASSISTANT') {
-            updated[last] = {
-              ...updated[last],
+          if (target?.role === 'ASSISTANT') {
+            updated[assistantSlot] = {
+              ...target,
               text: result.content,
             }
           }
@@ -333,12 +361,16 @@ export function ChatWorkspace() {
       if (err instanceof Error && err.name === 'AbortError') {
         setMessages((current) => {
           const updated = [...current]
-          const last = updated.length - 1
+          const target = updated[assistantSlot]
 
-          if (last >= 0 && updated[last].role === 'ASSISTANT') {
-            updated[last] = {
-              ...updated[last],
-              text: updated[last].text || 'Generation stopped',
+          if (target?.role === 'ASSISTANT') {
+            updated[assistantSlot] = {
+              ...target,
+              text:
+                target.text ||
+                (mode === 'regenerate'
+                  ? previousAssistantText
+                  : 'Generation stopped'),
             }
           }
 
@@ -349,15 +381,25 @@ export function ChatWorkspace() {
           err instanceof Error ? err.message : 'An unknown error occurred.',
         )
         setMessages((current) => {
-          const last = current.length - 1
-          if (
-            last >= 0 &&
-            current[last].role === 'ASSISTANT' &&
-            !current[last].text
-          ) {
-            return current.slice(0, last)
+          const updated = [...current]
+          const target = updated[assistantSlot]
+
+          if (target?.role !== 'ASSISTANT') return current
+
+          if (mode === 'regenerate') {
+            // Restore the previous answer so the saved history is not lost.
+            updated[assistantSlot] = {
+              ...target,
+              text: previousAssistantText,
+            }
+            return updated
           }
-          return current
+
+          if (!target.text) {
+            return updated.slice(0, assistantSlot)
+          }
+
+          return updated
         })
       }
     } finally {
@@ -385,8 +427,20 @@ export function ChatWorkspace() {
 
     if (userMessage?.role !== 'USER') return
 
+    // The backend addresses answers by their ordinal among assistant messages,
+    // not by their position in the rendered list.
+    const assistantOrdinal = messages
+      .slice(0, assistantIndex)
+      .filter((message) => message.role === 'ASSISTANT').length
+
     const history = messages.slice(0, userIndex)
-    void send(userMessage.text, history, 'regenerate')
+    void send(
+      userMessage.text,
+      history,
+      'regenerate',
+      assistantIndex,
+      assistantOrdinal,
+    )
   }
 
   const startNewChat = () => {

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createConversation,
+  getConversation,
   getRuntimeStatus,
   listModels,
   sendChat,
@@ -54,9 +55,9 @@ const RUNTIME: RuntimeStatus = {
   models_dir: '/models',
 }
 
-async function renderWorkspace() {
+async function renderWorkspace(path = '/workspace') {
   render(
-    <MemoryRouter initialEntries={['/workspace']}>
+    <MemoryRouter initialEntries={[path]}>
       <ChatWorkspace />
     </MemoryRouter>,
   )
@@ -64,6 +65,17 @@ async function renderWorkspace() {
   await screen.findByPlaceholderText('Write a prompt...')
   await waitFor(() => expect(listModels).toHaveBeenCalled())
 }
+
+const SAVED_MESSAGES = [
+  { id: 'm1', role: 'user' as const, content: 'Question one', tokens: 1 },
+  { id: 'm2', role: 'assistant' as const, content: 'Answer one', tokens: 1 },
+  { id: 'm3', role: 'user' as const, content: 'Question two', tokens: 1 },
+  { id: 'm4', role: 'assistant' as const, content: 'Answer two', tokens: 1 },
+].map((message) => ({
+  ...message,
+  conversation_id: 'conv-1',
+  created_at: null,
+}))
 
 function send(text: string) {
   const textarea = screen.getByPlaceholderText('Write a prompt...')
@@ -93,6 +105,16 @@ beforeEach(() => {
     updated_at: null,
     message_count: 0,
     preview: '',
+  })
+  vi.mocked(getConversation).mockResolvedValue({
+    id: 'conv-1',
+    title: 'Saved chat',
+    model: 'Model A',
+    created_at: null,
+    updated_at: null,
+    message_count: SAVED_MESSAGES.length,
+    preview: 'Answer two',
+    messages: SAVED_MESSAGES,
   })
   vi.mocked(sendChatStream).mockImplementation(() =>
     (async function* () {
@@ -139,5 +161,42 @@ describe('ChatWorkspace settings wiring', () => {
     })
 
     expect(await screen.findByText('Non-stream reply')).toBeInTheDocument()
+  })
+
+  it('regenerates the clicked assistant turn instead of the latest one', async () => {
+    vi.mocked(sendChatStream).mockImplementationOnce(() =>
+      (async function* () {
+        yield 'Answer one rewritten'
+      })(),
+    )
+
+    await renderWorkspace('/workspace?conversation=conv-1')
+    await screen.findByText('Answer one')
+    await screen.findByText('Answer two')
+
+    const regenerateButtons = screen.getAllByRole('button', {
+      name: /REGENERATE/,
+    })
+    expect(regenerateButtons).toHaveLength(2)
+
+    // Click the first answer, not the newest one.
+    fireEvent.click(regenerateButtons[0])
+
+    await waitFor(() => expect(sendChatStream).toHaveBeenCalledTimes(1))
+
+    const [sentMessages, options] = vi.mocked(sendChatStream).mock.calls[0]
+    expect(options).toMatchObject({
+      persist_user_message: false,
+      replace_assistant_index: 0,
+    })
+    // The target answer and everything after it are excluded from the prompt.
+    expect(sentMessages.map((message) => message.text)).toEqual([
+      'Question one',
+    ])
+
+    expect(await screen.findByText('Answer one rewritten')).toBeInTheDocument()
+    expect(screen.queryByText('Answer one')).not.toBeInTheDocument()
+    expect(screen.getByText('Question two')).toBeInTheDocument()
+    expect(screen.getByText('Answer two')).toBeInTheDocument()
   })
 })
